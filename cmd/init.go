@@ -2,946 +2,629 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
-	"os/signal"
 	"path/filepath"
-	"regexp"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/docker/docker/client"
-	"github.com/projectchimera/chimera/internal/agent"
-	"github.com/projectchimera/chimera/internal/compose"
-	"github.com/projectchimera/chimera/internal/git"
-	"github.com/projectchimera/chimera/internal/healer"
-	"github.com/projectchimera/chimera/internal/ports"
-	"github.com/projectchimera/chimera/internal/proxy"
-	"github.com/projectchimera/chimera/internal/scanner"
-	"github.com/projectchimera/chimera/internal/tui"
+	"chimera/internal/config"
+	"chimera/internal/detector"
+	"chimera/internal/envvar"
+	"chimera/internal/generator"
+	"chimera/internal/git"
+	"chimera/internal/llm"
+	"chimera/internal/tree"
+	"chimera/internal/ui"
+
 	"github.com/spf13/cobra"
 )
 
-var (
-	// initCwd is the working directory for the init command
-	initCwd string
-	// initForce forces re-initialization even if workspace exists
-	initForce bool
-	// initCreateProxy enables Caddy proxy and /etc/hosts setup
-	initCreateProxy bool
-	// initDockerRun starts Docker containers after generation
-	initDockerRun bool
-	// initNoAgent disables AI agent for config generation
-	initNoAgent bool
-)
-
-// initCmd represents the init command
 var initCmd = &cobra.Command{
-	Use:   "init <github-repo-url>",
-	Short: "Initialize a new Chimera workspace from a GitHub repository",
-	Long: `Initialize a new Chimera workspace by cloning a GitHub repository,
-analyzing its infrastructure dependencies, and generating a fully containerized
-local development environment configuration.
+	Use:   "init <github-url>",
+	Short: "Clone and orchestrate a GitHub repository",
+	Long: `Clone a GitHub repository, analyze its stack, and generate Docker configurations.
 
 By default, this command will:
-  1. Clone the repository (supports private repos via GITHUB_TOKEN or SSH)
-  2. Use AI agent to analyze the codebase (use --no-agent to disable)
-  3. Generate docker-compose.yml, Dockerfile, .env.example, and quick_start_guide.txt
-  4. Create configuration files WITHOUT starting containers
+  1. Clone the repository to ~/.chimera/repos/<repo-name>/
+  2. Generate a smart file tree (excluding node_modules, venv, etc.)
+  3. Detect technologies and frameworks (JS/TS, Python)
+  4. Validate findings with LLM (unless --no-agent is used)
+  5. Generate Dockerfile and docker-compose.yml
+  6. Extract environment variables
+  7. Write everything to chimera-outputs/
 
-Optional flags allow you to:
-  - Start Docker containers immediately (--docker-run)
-  - Set up reverse proxy and local domain (--create-proxy)
+Flags:
+  --force       Force re-initialization even if directory exists
+  --no-agent    Disable LLM validation (use static analysis only)
 
 Examples:
-  chimera init https://github.com/user/repo
-  chimera init https://github.com/user/repo --docker-run
-  chimera init https://github.com/user/repo --docker-run --create-proxy
+  chimera init https://github.com/tiangolo/fastapi
+  chimera init https://github.com/user/repo --force
   chimera init https://github.com/user/repo --no-agent
-  chimera init git@github.com:user/private-repo.git
-  chimera init https://github.com/user/repo --cwd ./my-workspace`,
-	Args: cobra.ExactArgs(1),
-	RunE: runInit,
+  chimera init https://github.com/user/repo --force --no-agent`,
+	Args:  cobra.ExactArgs(1),
+	Run: func(cmd *cobra.Command, args []string) {
+		if err := runInit(cmd, args[0]); err != nil {
+			fmt.Println()
+			errorBox := ui.ErrorBox.Render(fmt.Sprintf("Error: %s", err.Error()))
+			fmt.Println(errorBox)
+			os.Exit(1)
+		}
+	},
 }
+
+var (
+	initForce    bool
+	initNoAgent  bool
+)
 
 func init() {
-	rootCmd.AddCommand(initCmd)
-	initCmd.Flags().StringVar(&initCwd, "cwd", "", "Working directory for the workspace (defaults to ./chimera-<repo-name>)")
-	initCmd.Flags().BoolVar(&initForce, "force", false, "Force re-initialization even if workspace exists")
-	initCmd.Flags().BoolVar(&initCreateProxy, "create-proxy", false, "Set up Caddy proxy and /etc/hosts entry")
-	initCmd.Flags().BoolVar(&initDockerRun, "docker-run", false, "Start Docker containers after generating configs")
-	initCmd.Flags().BoolVar(&initNoAgent, "no-agent", false, "Disable AI agent (use template-based generation)")
+	initCmd.Flags().BoolVar(&initForce, "force", false, "Force re-initialization even if directory exists")
+	initCmd.Flags().BoolVar(&initNoAgent, "no-agent", false, "Disable LLM validation (use static analysis only)")
 }
 
-// runInit executes the full chimera init flow.
-func runInit(cmd *cobra.Command, args []string) error {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+func runInit(cmd *cobra.Command, repoURL string) error {
+	ctx := context.Background()
+	start := time.Now()
 
-	repoURL := args[0]
-	projectName := proxy.ProjectName(repoURL)
+	// Get flags
+	verbose := GetVerbose(cmd)
+	quiet := GetQuiet(cmd)
 
-	// Phase 1: Determine workspace directory
-	tui.PrintBanner()
-	tui.PrintPhase(1, 10, "Workspace Initialization")
-	workspaceDir, err := determineWorkspaceDir(repoURL, initCwd)
+	// Print banner (unless quiet)
+	if !quiet {
+		fmt.Print(ui.Header("init"))
+	}
+
+	// PRE-FLIGHT CHECK
+	if !quiet {
+		fmt.Println(ui.InfoLine("Pre-flight checks..."))
+	}
+
+	cfg, err := config.Load()
 	if err != nil {
-		tui.PrintError(fmt.Sprintf("Failed to determine workspace: %v", err))
+		return fmt.Errorf("Chimera is not configured.\nRun  chimera setup  first to choose a provider and set your API key")
+	}
+
+	if !git.IsValidGitHubURL(repoURL) {
+		return fmt.Errorf("invalid GitHub URL: must match https://github.com/<owner>/<repo>")
+	}
+
+	repoName := git.ExtractRepoName(repoURL)
+	if repoName == "" {
+		return fmt.Errorf("could not extract repository name from URL")
+	}
+
+	if !quiet {
+		fmt.Println(ui.SuccessLine("Configuration loaded"))
+		fmt.Println()
+	}
+
+	// STEP 1: CLONE
+	if !quiet {
+		fmt.Println(ui.InfoLine(fmt.Sprintf("Cloning %s...", ui.HighlightStyle.Render(repoName))))
+	}
+
+	reposDir, err := config.ReposDir()
+	if err != nil {
 		return err
 	}
 
-	// Check if workspace exists
-	if _, err := os.Stat(workspaceDir); err == nil {
+	if err := os.MkdirAll(reposDir, 0755); err != nil {
+		return fmt.Errorf("failed to create repos directory: %w", err)
+	}
+
+	targetDir := filepath.Join(reposDir, repoName)
+
+	// Check if directory exists
+	if _, err := os.Stat(targetDir); err == nil {
 		if !initForce {
-			tui.PrintError(fmt.Sprintf("Workspace already exists at %s. Use --force to re-initialize.", workspaceDir))
-			return fmt.Errorf("workspace already exists")
+			return fmt.Errorf("directory %s already exists. Use --force to re-initialize", targetDir)
 		}
-		// Force mode: remove existing workspace
-		tui.PrintWarning(fmt.Sprintf("Removing existing workspace: %s", workspaceDir))
-		if err := os.RemoveAll(workspaceDir); err != nil {
-			tui.PrintError(fmt.Sprintf("Failed to remove existing workspace: %v", err))
-			return fmt.Errorf("init: failed to remove existing workspace: %w", err)
+		if !quiet {
+			fmt.Println(ui.WarningLine("Removing existing directory (--force)"))
+		}
+		if err := os.RemoveAll(targetDir); err != nil {
+			return fmt.Errorf("failed to remove existing directory: %w", err)
 		}
 	}
 
-	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
-		return fmt.Errorf("init: failed to create workspace: %w", err)
+	// Clone the repository
+	if err := git.Clone(ctx, repoURL, targetDir, cfg.GitHubPAT); err != nil {
+		return fmt.Errorf("git clone failed: %w", err)
 	}
 
-	// Phase 2: Clone
-	tui.PrintPhase(2, 10, "Source Cloning")
-	tui.PrintInfo("Cloning repository from GitHub...")
-	gitClient := git.NewClient()
-	cloneOpts := &git.CloneOptions{
-		URL:       repoURL,
-		TargetDir: workspaceDir,
-		Depth:     1,
-	}
-	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		cloneOpts.Token = token
-	}
-
-	startTime := time.Now()
-	if err := gitClient.Clone(ctx, cloneOpts); err != nil {
-		os.RemoveAll(workspaceDir)
-		tui.PrintError(fmt.Sprintf("Clone failed: %v", err))
-		return fmt.Errorf("init: clone failed: %w", err)
-	}
-	tui.PrintSuccess(fmt.Sprintf("Repository cloned in %v", time.Since(startTime).Round(time.Millisecond)))
-
-	// Phase 3-6: Generate config (agent mode by default, unless --no-agent)
-	agentMode := !initNoAgent && os.Getenv("CHIMERA_AGENT") != "0"
-	var manifest *compose.ComposeManifest
-	var scanResult *scanner.ScanResult
-	var quickStartGuide string
-
-	if initNoAgent {
-		tui.PrintWarning("⚠ Running without AI agent")
-		tui.PrintWarning("  → Semantic understanding of the repo is not available")
-		tui.PrintWarning("  → Outputs are not guaranteed to be consistent")
-		tui.PrintWarning("  → Quick start guide will not be generated")
+	fileCount, size, _ := git.CountFiles(targetDir)
+	sizeMB := float64(size) / 1024 / 1024
+	if !quiet {
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Cloned %s (%d files, %.1f MB)", repoName, fileCount, sizeMB)))
 		fmt.Println()
-	} else if agentMode {
-		// Check if required env vars are present
-		provider := os.Getenv("CHIMERA_LLM_PROVIDER")
-		if provider == "" {
-			provider = "openai"
-		}
-		
-		var apiKeyPresent bool
-		switch strings.ToLower(provider) {
-		case "openai":
-			apiKeyPresent = os.Getenv("OPENAI_API_KEY") != ""
-		case "gemini":
-			apiKeyPresent = os.Getenv("GEMINI_API_KEY") != ""
-		case "groq":
-			apiKeyPresent = os.Getenv("GROQ_API_KEY") != ""
-		}
-		
-		if !apiKeyPresent {
-			tui.PrintWarning("⚠ AI agent mode requires API key configuration")
-			tui.PrintWarning(fmt.Sprintf("  → Provider: %s", provider))
-			tui.PrintWarning("  → API key not found in environment")
-			fmt.Println()
-			tui.PrintInfo("💡 Run 'chimera setup' to configure AI agent")
-			tui.PrintInfo("   Or set the required environment variables manually")
-			fmt.Println()
-			tui.PrintWarning("→ Falling back to template-based generation for compatibility")
-			fmt.Println()
-			agentMode = false
-		}
 	}
 
-	// Phase 3: Scan (required for template mode, best effort for agent mode)
-	tui.PrintPhase(3, 10, "Heuristic Analysis")
-	tui.PrintInfo("Scanning codebase...")
-	repoScanner := scanner.NewScanner(workspaceDir)
-	var scanErr error
-	scanResult, scanErr = repoScanner.Scan(ctx)
-	if scanErr != nil {
-		if agentMode {
-			tui.PrintWarning(fmt.Sprintf("Scan warning: %v", scanErr))
+	// STEP 2: TREE GENERATION
+	if !quiet {
+		fmt.Println(ui.InfoLine("Generating file tree..."))
+	}
+
+	treeStr, totalLines, err := tree.Generate(targetDir, 10000)
+	if err != nil {
+		return fmt.Errorf("tree generation failed: %w", err)
+	}
+
+	if !quiet {
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Generated tree (%d lines)", totalLines)))
+		fmt.Println()
+		
+		// Display tree
+		fmt.Println(ui.BoldStyle.Render("Repository Structure:"))
+		fmt.Println()
+		treeLines := strings.Split(treeStr, "\n")
+		displayLines := treeLines
+		if len(treeLines) > 60 && !verbose {
+			displayLines = treeLines[:60]
+		}
+		for _, line := range displayLines {
+			if line != "" {
+				fmt.Println(ui.DimStyle.Render("  " + line))
+			}
+		}
+		if len(treeLines) > 60 && !verbose {
+			fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  ... (%d more lines, use --verbose to see all)", len(treeLines)-60)))
+		}
+		fmt.Println()
+	}
+
+	// STEP 3: STATIC ANALYSIS
+	if !quiet {
+		fmt.Println(ui.InfoLine("Analyzing technology stack..."))
+	}
+
+	detectionResult, err := detector.Detect(targetDir)
+	if err != nil {
+		return fmt.Errorf("detection failed: %w", err)
+	}
+
+	if len(detectionResult.Services) == 0 {
+		warningBox := ui.WarningBox.Render(
+			"No supported project types detected.\n\n" +
+				"Chimera currently supports: Node.js/Express/Next.js, Python/FastAPI/Flask/Django.\n\n" +
+				"If this repo uses a supported technology, please open an issue.",
+		)
+		fmt.Println(warningBox)
+		return nil
+	}
+
+	if !quiet {
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Detected %d service(s) via static analysis", len(detectionResult.Services))))
+		fmt.Println()
+		
+		// Display detection summary
+		fmt.Println(ui.BoldStyle.Render("Detected Services:"))
+		fmt.Println()
+		table := &ui.Table{
+			Headers: []string{"Type", "Directory", "Technology", "Confidence"},
+			Rows:    [][]string{},
+		}
+
+		for _, svc := range detectionResult.Services {
+			typeStr := svc.Type
+			if svc.Type == "frontend" {
+				typeStr = ui.HighlightStyle.Render("Frontend")
+			} else {
+				typeStr = ui.PrimaryStyle.Render("Backend")
+			}
+
+			dir := svc.Directory
+			if dir == "" {
+				dir = "."
+			}
+
+			table.Rows = append(table.Rows, []string{
+				typeStr,
+				dir,
+				svc.Framework,
+				ui.ConfidenceBar(svc.Confidence),
+			})
+		}
+
+		fmt.Println(table.Render())
+		fmt.Println()
+	}
+
+	// STEP 4: LLM VALIDATION OF DETECTION (unless --no-agent)
+	if !initNoAgent {
+		if !quiet {
+			fmt.Println(ui.InfoLine("Validating detection with LLM..."))
+		}
+
+		llmClient, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
+		if err != nil {
+			if !quiet {
+				fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation skipped: %v", err)))
+			}
 		} else {
-			tui.PrintError(fmt.Sprintf("Scan failed: %v", scanErr))
-			return fmt.Errorf("init: scan failed: %w", scanErr)
-		}
-	} else {
-		tui.PrintSuccess(fmt.Sprintf("Detected: %s", formatLanguages(scanResult)))
-	}
-
-	if agentMode {
-		tui.PrintPhase(4, 10, "Agentic Config Generation")
-		// Try agent-based generation
-		prov, provErr := agent.NewProvider()
-		if provErr == nil {
-			config, agentErr := agent.Run(ctx, prov, workspaceDir, projectName)
-			if agentErr == nil {
-				if config.Explanation != "" {
-					tui.PrintInfo(fmt.Sprintf("Agent: %s", config.Explanation))
+			detectionJSON, _ := detectionResult.ToJSON()
+			
+			// File reader function
+			fileReader := func(path string) (string, error) {
+				if verbose {
+					fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  → Reading %s", path)))
 				}
-				tui.PrintSuccess("Agent-generated config created")
+				fullPath := filepath.Join(targetDir, path)
+				content, err := os.ReadFile(fullPath)
+				if err != nil {
+					return "", err
+				}
+				return string(content), nil
+			}
 
-				manifest = &compose.ComposeManifest{
-					ProjectName:   projectName,
-					DockerCompose: config.DockerCompose,
-					Dockerfile:    config.Dockerfile,
-					EnvExample:    config.EnvExample,
-					AppPort:       3000,
+			validationResp, err := llmClient.ValidateDetection(ctx, treeStr, detectionJSON, fileReader)
+			if err != nil {
+				if !quiet {
+					fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation failed: %v", err)))
+				}
+			} else if validationResp.Valid {
+				if !quiet {
+					fmt.Println(ui.SuccessLine("LLM confirmed detection"))
+				}
+			} else if len(validationResp.CorrectedServices) > 0 {
+				if !quiet {
+					fmt.Println(ui.SuccessLine("LLM provided corrections"))
 				}
 				
-				// Generate quick start guide from agent config
-				quickStartGuide = generateQuickStartGuide(projectName, config, scanResult)
-			} else {
-				tui.PrintWarning(fmt.Sprintf("Agent failed: %v — falling back to templates", agentErr))
-				agentMode = false
-			}
-		} else {
-			tui.PrintWarning(fmt.Sprintf("Agent unavailable: %v — falling back to templates", provErr))
-			agentMode = false
-		}
-	}
-
-	if manifest == nil {
-		if scanResult == nil {
-			return fmt.Errorf("init: unable to generate environment without scan results")
-		}
-
-		// Phase 4: Generate compose manifest from templates
-		tui.PrintPhase(4, 10, "Template Config Generation")
-		tui.PrintInfo("Generating environment via templates...")
-		var genErr error
-		manifest, genErr = compose.Generate(projectName, scanResult)
-		if genErr != nil {
-			tui.PrintError(fmt.Sprintf("Generation failed: %v", genErr))
-			return fmt.Errorf("init: generate failed: %w", genErr)
-		}
-		tui.PrintSuccess("docker-compose.yml generated")
-		
-		// Generate basic quick start guide for template mode
-		if !initNoAgent {
-			quickStartGuide = generateBasicQuickStartGuide(projectName, manifest, scanResult)
-		}
-	}
-
-	proxyEnabled := initCreateProxy
-	proxyHostPort := 80
-	appHostPort, appContainerPort := detectAppPorts(manifest.DockerCompose, manifest.AppPort)
-	if appHostPort <= 0 {
-		appHostPort = manifest.AppPort
-	}
-	if appContainerPort > 0 {
-		manifest.AppPort = appContainerPort
-	}
-
-	if proxyEnabled {
-		manifest.DockerCompose = ensureCaddyService(manifest.DockerCompose, projectName)
-	}
-
-	// Phase 5: Resolve port conflicts
-	tui.PrintPhase(5, 10, "Port Conflict Resolution")
-	tui.PrintInfo("Checking for port conflicts...")
-	desired := map[string]int{"app": appHostPort}
-	if scanResult != nil {
-		desired = compose.DefaultPorts(scanResult)
-		desired["app"] = appHostPort
-	}
-	if proxyEnabled {
-		desired["caddy-http"] = 80
-		desired["caddy-https"] = 443
-	}
-
-	_, remaps, portErr := ports.ResolveAll(desired)
-	if portErr != nil {
-		tui.PrintWarning(fmt.Sprintf("Port resolution issue: %v", portErr))
-	}
-	if len(remaps) > 0 {
-		ports.PrintRemaps(remaps, os.Stdout)
-		manifest.DockerCompose, manifest.EnvExample = ports.ApplyRemaps(
-			manifest.DockerCompose, manifest.EnvExample, remaps)
-		for _, remap := range remaps {
-			switch remap.Service {
-			case "app":
-				appHostPort = remap.To
-			case "caddy-http":
-				proxyHostPort = remap.To
+				// Convert LLM corrections to detector.Service format
+				correctedServices := make([]detector.Service, 0, len(validationResp.CorrectedServices))
+				for i, corrected := range validationResp.CorrectedServices {
+					confidenceStr := "medium"
+					if corrected.Confidence >= 0.9 {
+						confidenceStr = "high"
+					} else if corrected.Confidence < 0.6 {
+						confidenceStr = "low"
+					}
+					
+					language := "unknown"
+					if corrected.Framework == "next" || corrected.Framework == "express" || corrected.Framework == "node" {
+						language = "javascript"
+					} else if corrected.Framework == "fastapi" || corrected.Framework == "flask" || corrected.Framework == "django" {
+						language = "python"
+					}
+					
+					correctedServices = append(correctedServices, detector.Service{
+						ID:         fmt.Sprintf("service-%d", i+1),
+						Type:       corrected.Type,
+						Directory:  corrected.Directory,
+						Language:   language,
+						Framework:  corrected.Framework,
+						Confidence: confidenceStr,
+						IdentifierFiles: []string{},
+					})
+				}
+				
+				detectionResult.Services = correctedServices
 			}
 		}
-	}
-	tui.PrintSuccess("Ports resolved")
-
-	// Phase 6: Write files
-	tui.PrintPhase(6, 10, "Configuration Writing")
-	if err := writeManifest(workspaceDir, projectName, manifest, quickStartGuide); err != nil {
-		return fmt.Errorf("init: failed to write files: %w", err)
-	}
-	tui.PrintSuccess("Files written to workspace")
-
-	// Phase 7: Add /etc/hosts entry (only if --create-proxy)
-	tui.PrintPhase(7, 10, "Local Domain Setup")
-	if proxyEnabled {
-		domain := proxy.DeriveLocalDomain(repoURL)
-		// Write Caddyfile
-		caddyContent := proxy.GenerateCaddyfile(domain, manifest.AppPort)
-		if err := os.WriteFile(filepath.Join(workspaceDir, "Caddyfile"), []byte(caddyContent), 0644); err != nil {
-			return fmt.Errorf("init: failed to write Caddyfile: %w", err)
-		}
-
-		if err := proxy.AddEntry(domain, projectName); err != nil {
-			tui.PrintWarning(fmt.Sprintf("Could not update /etc/hosts: %v", err))
-		} else {
-			tui.PrintSuccess(fmt.Sprintf("Local domain: %s", domain))
+		if !quiet {
+			fmt.Println()
 		}
 	} else {
-		tui.PrintInfo("Skipped (use --create-proxy to enable)")
+		if !quiet {
+			fmt.Println(ui.InfoLine("LLM validation skipped (--no-agent mode)"))
+			fmt.Println()
+		}
 	}
 
-	// Phase 8: Start containers via docker compose (only if --docker-run)
-	tui.PrintPhase(8, 10, "Container Orchestration")
-	if initDockerRun {
-		tui.PrintInfo("Starting environment...")
-		if err := dockerComposeUp(ctx, workspaceDir, projectName); err != nil {
-			tui.PrintError(fmt.Sprintf("Failed to start environment: %v", err))
-			return fmt.Errorf("init: docker compose up failed: %w", err)
-		}
-		tui.PrintSuccess("All containers started")
+	// STEP 5: DOCKERFILE & COMPOSE GENERATION
+	if !quiet {
+		fmt.Println(ui.InfoLine("Generating Docker configurations..."))
+	}
 
-		// Phase 9: Watch for failures (background AI healer) - only if docker is running
-		tui.PrintPhase(9, 10, "AI Healer Initialization")
-		go func() {
-			dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	dockerfile := generator.GenerateMultiStage(detectionResult.Services)
+	composeFile := generator.GenerateCompose(detectionResult.Services, repoName)
+
+	if !quiet {
+		fmt.Println(ui.SuccessLine("Generated Dockerfile and docker-compose.yml"))
+		fmt.Println()
+	}
+
+	// STEP 6: LLM VALIDATION OF DOCKERFILES (unless --no-agent)
+	if !initNoAgent {
+		if !quiet {
+			fmt.Println(ui.InfoLine("Validating Docker configurations with LLM..."))
+		}
+
+		llmClient, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
+		if err != nil {
+			if !quiet {
+				fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation skipped: %v", err)))
+			}
+		} else {
+			fileReader := func(path string) (string, error) {
+				if verbose {
+					fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  → Reading %s", path)))
+				}
+				fullPath := filepath.Join(targetDir, path)
+				content, err := os.ReadFile(fullPath)
+				if err != nil {
+					return "", err
+				}
+				return string(content), nil
+			}
+
+			validationResp, err := llmClient.ValidateDockerfiles(ctx, treeStr, dockerfile, composeFile, fileReader)
 			if err != nil {
-				return
+				if !quiet {
+					fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation failed: %v", err)))
+				}
+			} else if validationResp.Valid {
+				if !quiet {
+					fmt.Println(ui.SuccessLine("LLM confirmed Docker configurations"))
+				}
+			} else {
+				if validationResp.CorrectedDockerfile != "" {
+					if !quiet {
+						fmt.Println(ui.SuccessLine("LLM corrected Dockerfile"))
+					}
+					dockerfile = validationResp.CorrectedDockerfile
+				}
+				if validationResp.CorrectedCompose != "" {
+					if !quiet {
+						fmt.Println(ui.SuccessLine("LLM corrected docker-compose.yml"))
+					}
+					composeFile = validationResp.CorrectedCompose
+				}
 			}
-			defer dockerCli.Close()
-
-			healer.Watch(ctx, dockerCli, projectName, func(containerID string) {
-				logs, _ := healer.CaptureLogs(ctx, dockerCli, containerID)
-				var envVars []string
-				if scanResult != nil {
-					envVars = scanResult.EnvVars
-				}
-				safeVars, safeCompose := healer.ScrubSecrets(envVars, manifest.DockerCompose)
-				provider, err := healer.NewProvider(ctx)
-				if err != nil {
-					return
-				}
-				diagnosis, err := provider.Diagnose(ctx, healer.DiagRequest{
-					Logs:          logs,
-					ComposeYAML:   safeCompose,
-					EnvVarNames:   safeVars,
-					ContainerName: containerID,
-				})
-				if err != nil {
-					return
-				}
-				healer.RenderDiagnosis(diagnosis, containerID, os.Stderr)
-			})
-		}()
-		tui.PrintSuccess("Healer attached to containers")
-	} else {
-		tui.PrintPhase(9, 10, "AI Healer Initialization")
-		tui.PrintInfo("Skipped (Docker not running)")
+		}
+		if !quiet {
+			fmt.Println()
+		}
 	}
 
-	// Phase 10: Print ready summary
-	tui.PrintPhase(10, 10, "Workspace Ready")
-	fmt.Println()
-	printReadySummary(projectName, manifest, workspaceDir, proxyEnabled, initDockerRun, proxyHostPort, appHostPort)
+	// STEP 7: ENV VAR DETECTION
+	if !quiet {
+		fmt.Println(ui.InfoLine("Detecting environment variables..."))
+	}
 
-	if initDockerRun && !GetQuiet(cmd) {
-		tui.PrintHint("Press Ctrl+C to stop watching...")
-		<-ctx.Done()
+	envResults := envvar.Detect(targetDir, detectionResult.Services)
+
+	totalVars := 0
+	for _, result := range envResults {
+		totalVars += len(result.Vars)
+	}
+
+	if !quiet {
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Detected %d environment variable(s)", totalVars)))
+		fmt.Println()
+	}
+
+	// STEP 8: LLM VALIDATION OF ENV VARS (unless --no-agent)
+	if !initNoAgent {
+		if !quiet {
+			fmt.Println(ui.InfoLine("Enhancing environment variables with LLM..."))
+		}
+
+		llmClient, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
+		if err != nil {
+			if !quiet {
+				fmt.Println(ui.WarningLine(fmt.Sprintf("LLM enhancement skipped: %v", err)))
+			}
+		} else {
+			// Check for existing .env files
+			existingEnvFiles := findExistingEnvFiles(targetDir)
+			existingEnvContent := ""
+			if len(existingEnvFiles) > 0 {
+				if !quiet {
+					fmt.Println(ui.InfoLine(fmt.Sprintf("Found %d existing .env file(s)", len(existingEnvFiles))))
+				}
+				var envBuilder strings.Builder
+				for _, envFile := range existingEnvFiles {
+					content, err := os.ReadFile(filepath.Join(targetDir, envFile))
+					if err == nil {
+						envBuilder.WriteString(fmt.Sprintf("\n=== %s ===\n%s\n", envFile, string(content)))
+					}
+				}
+				existingEnvContent = envBuilder.String()
+			}
+
+			// Convert env results to JSON
+			envJSON, _ := json.Marshal(envResults)
+
+			fileReader := func(path string) (string, error) {
+				if verbose {
+					fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  → Reading %s", path)))
+				}
+				fullPath := filepath.Join(targetDir, path)
+				content, err := os.ReadFile(fullPath)
+				if err != nil {
+					return "", err
+				}
+				return string(content), nil
+			}
+
+			validationResp, err := llmClient.ValidateEnvVars(ctx, treeStr, string(envJSON), existingEnvContent, fileReader)
+			if err != nil {
+				if !quiet {
+					fmt.Println(ui.WarningLine(fmt.Sprintf("LLM enhancement failed: %v", err)))
+				}
+			} else if len(validationResp.CorrectedEnvVars) > 0 {
+				if !quiet {
+					fmt.Println(ui.SuccessLine("LLM enhanced environment variables"))
+				}
+				
+				// Replace env results with LLM-enhanced versions
+				envResults = make([]envvar.Result, 0, len(validationResp.CorrectedEnvVars))
+				for _, corrected := range validationResp.CorrectedEnvVars {
+					envResults = append(envResults, envvar.Result{
+						Directory:   corrected.Directory,
+						ServiceType: corrected.ServiceType,
+						Technology:  corrected.Technology,
+						Vars:        []envvar.EnvVar{},
+						EnvContent:  corrected.EnvContent,
+					})
+				}
+			}
+		}
+		if !quiet {
+			fmt.Println()
+		}
+	}
+
+	// STEP 9: WRITE chimera-outputs/
+	if !quiet {
+		fmt.Println(ui.InfoLine("Writing output files..."))
+	}
+
+	outputDir := filepath.Join(targetDir, "chimera-outputs")
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return fmt.Errorf("failed to create output directory: %w", err)
+	}
+
+	// Write Dockerfile
+	dockerfilePath := filepath.Join(outputDir, "Dockerfile")
+	if err := os.WriteFile(dockerfilePath, []byte(dockerfile), 0644); err != nil {
+		return fmt.Errorf("failed to write Dockerfile: %w", err)
+	}
+	if !quiet {
+		fmt.Println(ui.SuccessLine("  ✓ Dockerfile"))
+	}
+
+	// Write docker-compose.yml
+	composePath := filepath.Join(outputDir, "docker-compose.yml")
+	if err := os.WriteFile(composePath, []byte(composeFile), 0644); err != nil {
+		return fmt.Errorf("failed to write docker-compose.yml: %w", err)
+	}
+	if !quiet {
+		fmt.Println(ui.SuccessLine("  ✓ docker-compose.yml"))
+	}
+
+	// Write .gitignore
+	gitignorePath := filepath.Join(outputDir, ".gitignore")
+	if err := os.WriteFile(gitignorePath, []byte("*\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write .gitignore: %w", err)
+	}
+	if !quiet {
+		fmt.Println(ui.SuccessLine("  ✓ .gitignore"))
+	}
+
+	// Write env vars
+	for _, envResult := range envResults {
+		serviceName := strings.ReplaceAll(envResult.Directory, "/", "-")
+		if serviceName == "" {
+			serviceName = "root"
+		}
+		serviceName = strings.ToLower(serviceName)
+
+		envDir := filepath.Join(outputDir, "env-vars", serviceName)
+		if err := os.MkdirAll(envDir, 0755); err != nil {
+			return fmt.Errorf("failed to create env-vars directory: %w", err)
+		}
+
+		var envContent string
+		if envResult.EnvContent != "" {
+			// Use LLM-generated content
+			envContent = envResult.EnvContent
+		} else {
+			// Use static generation
+			envContent = envvar.GenerateEnvExample(envResult.Vars, envResult.Technology)
+		}
+
+		envPath := filepath.Join(envDir, ".env.example")
+		if err := os.WriteFile(envPath, []byte(envContent), 0644); err != nil {
+			return fmt.Errorf("failed to write .env.example: %w", err)
+		}
+		if !quiet {
+			fmt.Println(ui.SuccessLine(fmt.Sprintf("  ✓ env-vars/%s/.env.example", serviceName)))
+		}
+	}
+
+	// Generate and write quick start guide
+	quickStartGuide := generateQuickStartGuide(repoName, detectionResult, envResults)
+	quickStartPath := filepath.Join(outputDir, "quick_start_guide.txt")
+	if err := os.WriteFile(quickStartPath, []byte(quickStartGuide), 0644); err != nil {
+		return fmt.Errorf("failed to write quick_start_guide.txt: %w", err)
+	}
+	if !quiet {
+		fmt.Println(ui.SuccessLine("  ✓ quick_start_guide.txt"))
+	}
+
+	if !quiet {
+		fmt.Println()
+	}
+
+	// COMPLETION
+	if !quiet {
+		duration := time.Since(start)
+		completionBox := ui.SuccessBox.Render(fmt.Sprintf(
+			"Init complete for %s\n\n"+
+				"Files written to: %s\n\n"+
+				"Next steps:\n"+
+				"  1. Review chimera-outputs/env-vars/<service>/.env.example\n"+
+				"  2. Copy to .env and fill in your secrets\n"+
+				"  3. Run: docker compose -f chimera-outputs/docker-compose.yml up\n\n"+
+				"Completed in %.1fs",
+			ui.HighlightStyle.Render(repoName),
+			ui.HighlightStyle.Render(outputDir),
+			duration.Seconds(),
+		))
+
+		fmt.Println(completionBox)
+		fmt.Println()
 	}
 
 	return nil
 }
 
-var appPortBindingRegex = regexp.MustCompile(`-\s*"(\d{2,5}):(\d{2,5})"`)
-
-// detectAppPorts attempts to infer app host and container ports from compose YAML.
-func detectAppPorts(composeYAML string, fallback int) (int, int) {
-	hostPort := fallback
-	containerPort := fallback
-
-	lines := strings.Split(composeYAML, "\n")
-	inApp := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		if strings.HasPrefix(line, "  app:") {
-			inApp = true
-			continue
+// findExistingEnvFiles searches for .env.example, .env.sample, etc.
+func findExistingEnvFiles(rootDir string) []string {
+	var envFiles []string
+	patterns := []string{".env.example", ".env.sample", ".env.template", ".env.local.example"}
+	
+	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
 		}
-
-		if inApp && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && strings.HasSuffix(trimmed, ":") {
-			break
-		}
-
-		if !inApp {
-			continue
-		}
-
-		match := appPortBindingRegex.FindStringSubmatch(trimmed)
-		if len(match) == 3 {
-			host, errHost := strconv.Atoi(match[1])
-			container, errContainer := strconv.Atoi(match[2])
-			if errHost == nil {
-				hostPort = host
+		
+		relPath, _ := filepath.Rel(rootDir, path)
+		for _, pattern := range patterns {
+			if strings.HasSuffix(info.Name(), pattern) {
+				envFiles = append(envFiles, relPath)
+				break
 			}
-			if errContainer == nil {
-				containerPort = container
-			}
-			break
 		}
-	}
-
-	return hostPort, containerPort
+		return nil
+	})
+	
+	return envFiles
 }
 
-// detectAppNetwork returns the first app service network, if present.
-func detectAppNetwork(composeYAML string) string {
-	lines := strings.Split(composeYAML, "\n")
-	inApp := false
-	inNetworks := false
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		if strings.HasPrefix(line, "  app:") {
-			inApp = true
-			continue
-		}
-
-		if inApp && strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && strings.HasSuffix(trimmed, ":") {
-			break
-		}
-
-		if !inApp {
-			continue
-		}
-
-		if strings.HasPrefix(line, "    networks:") {
-			inNetworks = true
-			continue
-		}
-
-		if !inNetworks {
-			continue
-		}
-
-		if strings.HasPrefix(line, "      - ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "      - "))
-		}
-
-		if strings.HasPrefix(line, "      ") && strings.HasSuffix(trimmed, ":") {
-			return strings.TrimSuffix(strings.TrimSpace(line), ":")
-		}
-
-		if !strings.HasPrefix(line, "      ") {
-			inNetworks = false
-		}
-	}
-
-	return ""
+func generateQuickStartGuide(projectName string, detection *detector.Result, envResults []envvar.Result) string {
+var b strings.Builder
+b.WriteString("═══════════════════════════════════════════════════════════════\n")
+b.WriteString(fmt.Sprintf("  QUICK START GUIDE - %s\n", strings.ToUpper(projectName)))
+b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
+b.WriteString("DETECTED SERVICES:\n")
+for _, svc := range detection.Services {
+dir := svc.Directory
+if dir == "" {
+dir = "root"
 }
-
-// ensureCaddyService injects a Caddy service into compose YAML if not already present.
-func ensureCaddyService(composeYAML, projectName string) string {
-	if strings.Contains(composeYAML, "\n  caddy:\n") {
-		return composeYAML
-	}
-
-	netName := detectAppNetwork(composeYAML)
-	if netName == "" && strings.Contains(composeYAML, "\nnetworks:\n") {
-		netName = projectName + "_net"
-	}
-
-	snippet := proxy.CaddyComposeSnippet(projectName, netName)
-	idx := strings.Index(composeYAML, "\nnetworks:\n")
-	if idx == -1 {
-		return strings.TrimRight(composeYAML, "\n") + snippet + "\n"
-	}
-
-	return composeYAML[:idx] + snippet + composeYAML[idx:]
+b.WriteString(fmt.Sprintf("  • %s (%s) in %s/\n", svc.Framework, svc.Type, dir))
 }
-
-// determineWorkspaceDir determines the workspace directory.
-func determineWorkspaceDir(repoURL, cwdFlag string) (string, error) {
-	if cwdFlag != "" {
-		return filepath.Abs(cwdFlag)
-	}
-	repoName := git.ExtractRepoName(repoURL)
-	if repoName == "" {
-		return "", fmt.Errorf("init: could not extract repo name from URL: %s", repoURL)
-	}
-	return filepath.Abs(filepath.Join(".", fmt.Sprintf("chimera-%s", repoName)))
-}
-
-// writeManifest writes all generated files to the workspace.
-func writeManifest(dir, projectName string, m *compose.ComposeManifest, quickStartGuide string) error {
-	files := map[string]string{
-		"docker-compose.yml": m.DockerCompose,
-		"Dockerfile":         m.Dockerfile,
-		".env.example":       m.EnvExample,
-		".env":               m.EnvExample,
-	}
-	
-	if quickStartGuide != "" {
-		files["quick_start_guide.txt"] = quickStartGuide
-	}
-	
-	for name, content := range files {
-		path := filepath.Join(dir, name)
-		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-			return fmt.Errorf("init: failed to write %s: %w", name, err)
-		}
-	}
-
-	// Write .chimera project marker file
-	chimeraFile := filepath.Join(dir, ".chimera")
-	return os.WriteFile(chimeraFile, []byte(projectName+"\n"), 0644)
-}
-
-// dockerComposeUp runs docker compose up in the workspace directory.
-func dockerComposeUp(ctx context.Context, workspaceDir, projectName string) error {
-	composeCmd := exec.CommandContext(ctx,
-		"docker", "compose",
-		"-f", filepath.Join(workspaceDir, "docker-compose.yml"),
-		"-p", projectName,
-		"up", "-d", "--build", "--remove-orphans",
-	)
-	composeCmd.Dir = workspaceDir
-	composeCmd.Stdout = os.Stdout
-	composeCmd.Stderr = os.Stderr
-
-	return composeCmd.Run()
-}
-
-// formatLanguages returns a human-readable string of detected languages.
-func formatLanguages(result *scanner.ScanResult) string {
-	names := make([]string, 0, len(result.Languages))
-	for _, l := range result.Languages {
-		names = append(names, fmt.Sprintf("%s %s", l.Name, l.Version))
-	}
-	if len(names) == 0 {
-		return "no languages"
-	}
-	s := ""
-	for i, n := range names {
-		if i > 0 {
-			s += ", "
-		}
-		s += n
-	}
-	return s
-}
-
-// printReadySummary prints the final ready message.
-func printReadySummary(projectName string, manifest *compose.ComposeManifest, workspaceDir string, proxyEnabled bool, dockerRunning bool, proxyHostPort int, appHostPort int) {
-	successStyle := tui.SuccessStyle
-	infoStyle := tui.InfoStyle
-
-	fmt.Println(successStyle.Render("  ✓ Configuration generated!"))
-	fmt.Println()
-
-	fmt.Println(infoStyle.Render(fmt.Sprintf("  Workspace:   %s", workspaceDir)))
-	fmt.Println(infoStyle.Render("  Files created:"))
-	fmt.Println(infoStyle.Render("    • docker-compose.yml"))
-	fmt.Println(infoStyle.Render("    • Dockerfile"))
-	fmt.Println(infoStyle.Render("    • .env.example"))
-	fmt.Println(infoStyle.Render("    • .env"))
-	fmt.Println(infoStyle.Render("    • quick_start_guide.txt"))
-	if proxyEnabled {
-		fmt.Println(infoStyle.Render("    • Caddyfile"))
-	}
-	fmt.Println()
-
-	if dockerRunning {
-		fmt.Println(successStyle.Render("  ✓ Docker containers running!"))
-		fmt.Println()
-		
-		if proxyEnabled {
-			domain := projectName + ".local"
-			if proxyHostPort == 80 {
-				fmt.Println(infoStyle.Render(fmt.Sprintf("  Local URL:   http://%s", domain)))
-			} else {
-				fmt.Println(infoStyle.Render(fmt.Sprintf("  Local URL:   http://%s:%d", domain, proxyHostPort)))
-			}
-		} else {
-			fmt.Println(infoStyle.Render(fmt.Sprintf("  Local URL:   http://localhost:%d", appHostPort)))
-		}
-
-		if len(manifest.InfraServices) > 0 {
-			svc := ""
-			for i, s := range manifest.InfraServices {
-				if i > 0 {
-					svc += ", "
-				}
-				svc += s
-			}
-			fmt.Println(infoStyle.Render(fmt.Sprintf("  Services:    %s", svc)))
-		}
-		fmt.Println()
-		fmt.Println(infoStyle.Render("  Dashboard:   chimera stats"))
-		fmt.Println(infoStyle.Render("  Cleanup:     chimera nuke"))
-	} else {
-		fmt.Println(infoStyle.Render("  📖 Next steps:"))
-		fmt.Println(infoStyle.Render(fmt.Sprintf("    1. Review %s/quick_start_guide.txt", workspaceDir)))
-		fmt.Println(infoStyle.Render(fmt.Sprintf("    2. Edit %s/.env with your secrets", workspaceDir)))
-		fmt.Println(infoStyle.Render(fmt.Sprintf("    3. cd %s", workspaceDir)))
-		fmt.Println(infoStyle.Render("    4. Choose your startup method:"))
-		fmt.Println()
-		fmt.Println(infoStyle.Render("       With Docker:"))
-		fmt.Println(infoStyle.Render("         docker compose up -d"))
-		fmt.Println()
-		fmt.Println(infoStyle.Render("       Or re-run with Docker:"))
-		fmt.Println(infoStyle.Render(fmt.Sprintf("         chimera init <repo-url> --docker-run --force")))
-		fmt.Println()
-		fmt.Println(infoStyle.Render("       Without Docker:"))
-		fmt.Println(infoStyle.Render("         See quick_start_guide.txt for manual setup"))
-	}
-	fmt.Println()
-}
-
-// generateQuickStartGuide creates a comprehensive quick start guide from agent config
-func generateQuickStartGuide(projectName string, config *agent.Config, scanResult *scanner.ScanResult) string {
-	var b strings.Builder
-	
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString(fmt.Sprintf("  QUICK START GUIDE - %s\n", strings.ToUpper(projectName)))
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	
-	if config.Explanation != "" {
-		b.WriteString("PROJECT OVERVIEW:\n")
-		b.WriteString(fmt.Sprintf("  %s\n\n", config.Explanation))
-	}
-	
-	// Detected technologies
-	b.WriteString("DETECTED TECHNOLOGIES:\n")
-	if scanResult != nil && len(scanResult.Languages) > 0 {
-		for _, lang := range scanResult.Languages {
-			b.WriteString(fmt.Sprintf("  • %s %s\n", lang.Name, lang.Version))
-		}
-	}
-	if len(config.Services) > 0 {
-		b.WriteString("\nSERVICES:\n")
-		for _, svc := range config.Services {
-			b.WriteString(fmt.Sprintf("  • %s (%s) - Port %d\n", svc.Name, svc.Type, svc.Port))
-		}
-	}
-	b.WriteString("\n")
-	
-	// Prerequisites
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("PREREQUISITES\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	b.WriteString("For Docker setup:\n")
-	b.WriteString("  • Docker 20.10+ installed\n")
-	b.WriteString("  • Docker Compose V2\n\n")
-	b.WriteString("For manual setup:\n")
-	if scanResult != nil {
-		for _, lang := range scanResult.Languages {
-			switch lang.Name {
-			case "Node.js":
-				b.WriteString(fmt.Sprintf("  • Node.js %s or higher\n", lang.Version))
-				b.WriteString("  • npm or yarn package manager\n")
-			case "Python":
-				b.WriteString(fmt.Sprintf("  • Python %s or higher\n", lang.Version))
-				b.WriteString("  • pip package manager\n")
-			case "Go":
-				b.WriteString(fmt.Sprintf("  • Go %s or higher\n", lang.Version))
-			}
-		}
-	}
-	b.WriteString("\n")
-	
-	// Option 1: Docker
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("OPTION 1: RUN WITH DOCKER (RECOMMENDED)\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	b.WriteString("1. Configure environment variables:\n")
-	b.WriteString("   cp .env.example .env\n")
-	b.WriteString("   nano .env  # Edit with your secrets\n\n")
-	b.WriteString("2. Start all services:\n")
-	b.WriteString("   docker compose up -d\n\n")
-	b.WriteString("3. View logs:\n")
-	b.WriteString("   docker compose logs -f\n\n")
-	b.WriteString("4. Stop services:\n")
-	b.WriteString("   docker compose down\n\n")
-	b.WriteString("5. Stop and remove volumes (⚠ deletes data):\n")
-	b.WriteString("   docker compose down -v\n\n")
-	
-	// Option 2: Manual
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("OPTION 2: RUN WITHOUT DOCKER (MANUAL SETUP)\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	
-	if scanResult != nil {
-		hasNode := false
-		hasPython := false
-		hasGo := false
-		
-		for _, lang := range scanResult.Languages {
-			switch lang.Name {
-			case "Node.js":
-				hasNode = true
-			case "Python":
-				hasPython = true
-			case "Go":
-				hasGo = true
-			}
-		}
-		
-		// Infrastructure services
-		if scanResult.Infrastructure != nil && len(scanResult.Infrastructure) > 0 {
-			b.WriteString("1. Start infrastructure services:\n\n")
-			for _, infra := range scanResult.Infrastructure {
-				switch infra.Type {
-				case "postgresql":
-					b.WriteString("   PostgreSQL:\n")
-					b.WriteString("     # Using Docker:\n")
-					b.WriteString("     docker run -d --name postgres -p 5432:5432 \\\n")
-					b.WriteString("       -e POSTGRES_PASSWORD=postgres postgres:15-alpine\n\n")
-					b.WriteString("     # Or install locally:\n")
-					b.WriteString("     # macOS: brew install postgresql@15\n")
-					b.WriteString("     # Ubuntu: sudo apt install postgresql-15\n\n")
-				case "redis":
-					b.WriteString("   Redis:\n")
-					b.WriteString("     # Using Docker:\n")
-					b.WriteString("     docker run -d --name redis -p 6379:6379 redis:7-alpine\n\n")
-					b.WriteString("     # Or install locally:\n")
-					b.WriteString("     # macOS: brew install redis\n")
-					b.WriteString("     # Ubuntu: sudo apt install redis-server\n\n")
-				case "mongodb":
-					b.WriteString("   MongoDB:\n")
-					b.WriteString("     # Using Docker:\n")
-					b.WriteString("     docker run -d --name mongodb -p 27017:27017 mongo:7\n\n")
-					b.WriteString("     # Or install locally:\n")
-					b.WriteString("     # macOS: brew install mongodb-community\n")
-					b.WriteString("     # Ubuntu: sudo apt install mongodb\n\n")
-				case "mysql":
-					b.WriteString("   MySQL:\n")
-					b.WriteString("     # Using Docker:\n")
-					b.WriteString("     docker run -d --name mysql -p 3306:3306 \\\n")
-					b.WriteString("       -e MYSQL_ROOT_PASSWORD=root mysql:8-alpine\n\n")
-				}
-			}
-		}
-		
-		stepNum := 2
-		if len(scanResult.Infrastructure) == 0 {
-			stepNum = 1
-		}
-		
-		// Application setup
-		b.WriteString(fmt.Sprintf("%d. Configure environment:\n", stepNum))
-		b.WriteString("   cp .env.example .env\n")
-		b.WriteString("   nano .env  # Edit with your configuration\n\n")
-		stepNum++
-		
-		if hasNode {
-			b.WriteString(fmt.Sprintf("%d. Install Node.js dependencies:\n", stepNum))
-			nodeFiles := []string{}
-			for _, lang := range scanResult.Languages {
-				if lang.Name == "Node.js" {
-					nodeFiles = lang.Files
-					break
-				}
-			}
-			if len(nodeFiles) > 1 {
-				b.WriteString("   # Multiple Node.js projects detected:\n")
-				for _, file := range nodeFiles {
-					dir := filepath.Dir(file)
-					if dir == "." {
-						b.WriteString("   npm install\n")
-					} else {
-						b.WriteString(fmt.Sprintf("   cd %s && npm install && cd ..\n", dir))
-					}
-				}
-			} else {
-				b.WriteString("   npm install\n")
-			}
-			b.WriteString("\n")
-			stepNum++
-		}
-		
-		if hasPython {
-			b.WriteString(fmt.Sprintf("%d. Install Python dependencies:\n", stepNum))
-			b.WriteString("   python -m venv venv\n")
-			b.WriteString("   source venv/bin/activate  # On Windows: venv\\Scripts\\activate\n")
-			pythonFiles := []string{}
-			for _, lang := range scanResult.Languages {
-				if lang.Name == "Python" {
-					pythonFiles = lang.Files
-					break
-				}
-			}
-			if len(pythonFiles) > 0 {
-				reqFile := pythonFiles[0]
-				if strings.Contains(reqFile, "/") {
-					dir := filepath.Dir(reqFile)
-					b.WriteString(fmt.Sprintf("   pip install -r %s/%s\n", dir, filepath.Base(reqFile)))
-				} else {
-					b.WriteString(fmt.Sprintf("   pip install -r %s\n", reqFile))
-				}
-			}
-			b.WriteString("\n")
-			stepNum++
-		}
-		
-		if hasGo {
-			b.WriteString(fmt.Sprintf("%d. Install Go dependencies:\n", stepNum))
-			b.WriteString("   go mod download\n\n")
-			stepNum++
-		}
-		
-		// Start commands
-		b.WriteString(fmt.Sprintf("%d. Start the application:\n\n", stepNum))
-		
-		if hasNode {
-			b.WriteString("   Node.js:\n")
-			nodeFiles := []string{}
-			for _, lang := range scanResult.Languages {
-				if lang.Name == "Node.js" {
-					nodeFiles = lang.Files
-					break
-				}
-			}
-			if len(nodeFiles) > 1 {
-				for _, file := range nodeFiles {
-					dir := filepath.Dir(file)
-					if dir == "." {
-						b.WriteString("     npm start\n")
-					} else {
-						b.WriteString(fmt.Sprintf("     # In %s/:\n", dir))
-						b.WriteString(fmt.Sprintf("     cd %s && npm start\n", dir))
-					}
-				}
-			} else {
-				b.WriteString("     npm start\n")
-				b.WriteString("     # Or for development:\n")
-				b.WriteString("     npm run dev\n")
-			}
-			b.WriteString("\n")
-		}
-		
-		if hasPython {
-			b.WriteString("   Python:\n")
-			pythonFiles := []string{}
-			for _, lang := range scanResult.Languages {
-				if lang.Name == "Python" {
-					pythonFiles = lang.Files
-					break
-				}
-			}
-			if len(pythonFiles) > 0 && strings.Contains(pythonFiles[0], "/") {
-				dir := filepath.Dir(pythonFiles[0])
-				b.WriteString(fmt.Sprintf("     cd %s\n", dir))
-			}
-			b.WriteString("     # FastAPI/Uvicorn:\n")
-			b.WriteString("     uvicorn main:app --reload --host 0.0.0.0 --port 8000\n\n")
-			b.WriteString("     # Flask:\n")
-			b.WriteString("     flask run --host 0.0.0.0 --port 8000\n\n")
-			b.WriteString("     # Django:\n")
-			b.WriteString("     python manage.py runserver 0.0.0.0:8000\n\n")
-		}
-		
-		if hasGo {
-			b.WriteString("   Go:\n")
-			b.WriteString("     go run .\n")
-			b.WriteString("     # Or build and run:\n")
-			b.WriteString("     go build -o app && ./app\n\n")
-		}
-	}
-	
-	// Troubleshooting
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("TROUBLESHOOTING\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	b.WriteString("Port already in use:\n")
-	b.WriteString("  • Check: lsof -i :<port> (macOS/Linux) or netstat -ano | findstr :<port> (Windows)\n")
-	b.WriteString("  • Kill process or change port in .env\n\n")
-	b.WriteString("Database connection failed:\n")
-	b.WriteString("  • Verify database is running\n")
-	b.WriteString("  • Check DATABASE_URL in .env\n")
-	b.WriteString("  • Ensure database exists: CREATE DATABASE <dbname>;\n\n")
-	b.WriteString("Permission denied:\n")
-	b.WriteString("  • Docker: Add user to docker group or use sudo\n")
-	b.WriteString("  • Files: Check file permissions with ls -la\n\n")
-	
-	// Useful commands
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("USEFUL COMMANDS\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	b.WriteString("Chimera commands:\n")
-	b.WriteString("  chimera stats              # View live container stats\n")
-	b.WriteString("  chimera diagnose           # AI-powered diagnostics\n")
-	b.WriteString("  chimera nuke               # Complete cleanup\n\n")
-	b.WriteString("Docker commands:\n")
-	b.WriteString("  docker compose ps          # List running containers\n")
-	b.WriteString("  docker compose logs -f     # Follow logs\n")
-	b.WriteString("  docker compose restart     # Restart services\n")
-	b.WriteString("  docker compose exec app sh # Shell into app container\n\n")
-	
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("Generated by Chimera - Autonomous Environment Orchestration\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	
-	return b.String()
-}
-
-// generateBasicQuickStartGuide creates a basic guide for template-based generation
-func generateBasicQuickStartGuide(projectName string, manifest *compose.ComposeManifest, scanResult *scanner.ScanResult) string {
-	var b strings.Builder
-	
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString(fmt.Sprintf("  QUICK START GUIDE - %s\n", strings.ToUpper(projectName)))
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	
-	b.WriteString("⚠ NOTE: This guide was generated using template-based detection.\n")
-	b.WriteString("   For more accurate instructions, re-run with AI agent enabled.\n\n")
-	
-	// Basic Docker instructions
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("RUN WITH DOCKER\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-	b.WriteString("1. Configure environment:\n")
-	b.WriteString("   cp .env.example .env\n")
-	b.WriteString("   nano .env\n\n")
-	b.WriteString("2. Start services:\n")
-	b.WriteString("   docker compose up -d\n\n")
-	b.WriteString("3. View logs:\n")
-	b.WriteString("   docker compose logs -f\n\n")
-	b.WriteString("4. Stop services:\n")
-	b.WriteString("   docker compose down\n\n")
-	
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	b.WriteString("For detailed manual setup instructions, please refer to your\n")
-	b.WriteString("project's README or re-run chimera with AI agent enabled.\n")
-	b.WriteString("═══════════════════════════════════════════════════════════════\n")
-	
-	return b.String()
+b.WriteString("\n═══════════════════════════════════════════════════════════════\n")
+b.WriteString("DOCKER SETUP (RECOMMENDED)\n")
+b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
+b.WriteString("1. Configure environment:\n")
+b.WriteString("   cp chimera-outputs/env-vars/*/.env.example .env\n")
+b.WriteString("   nano .env  # Edit with your secrets\n\n")
+b.WriteString("2. Start services:\n")
+b.WriteString("   docker compose -f chimera-outputs/docker-compose.yml up -d\n\n")
+b.WriteString("3. View logs:\n")
+b.WriteString("   docker compose -f chimera-outputs/docker-compose.yml logs -f\n\n")
+b.WriteString("4. Stop services:\n")
+b.WriteString("   docker compose -f chimera-outputs/docker-compose.yml down\n\n")
+b.WriteString("═══════════════════════════════════════════════════════════════\n")
+b.WriteString("Generated by Chimera v0.1.0\n")
+b.WriteString("═══════════════════════════════════════════════════════════════\n")
+return b.String()
 }

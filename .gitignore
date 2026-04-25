@@ -1,91 +1,24 @@
-# Binaries for programs and plugins
+# Binaries
+chimera
 *.exe
-*.exe~
 *.dll
 *.so
 *.dylib
-
-# Test binary, built with `go test -c`
 *.test
-
-# Output of the go coverage tool
 *.out
-coverage.html
 
-# Build directories
-build/
-dist/
-
-# Go workspace file
-go.work
-go.work.sum
-
-# Local Go module/GOPATH caches used in this repo
-.gomod/
-.gopath/
-
-# Go module cache
-go.sum.bak
-
-# IDE specific files
+# Directories
+vendor/
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-.fleet/
-*.iml
-
-# OS specific files
 .DS_Store
 Thumbs.db
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Desktop.ini
+build/
+dist/
 
-# Environment files
-.env
-.env.local
-.env.*.local
+# Config (for testing)
 .chimera.env
-
-# Temporary files
-tmp/
-temp/
-test-output/
-test-output-*/
-*.log
-*.tmp
-
-# Test files and scripts
-*_test.sh
-test_*.sh
-test_*.go
-simple_test.go
-final_test.go
-quick_test.sh
-run_test.sh
-
-# Documentation that shouldn't be committed
-MONOREPO_FIX.md
-IMPLEMENTATION_SUMMARY.md
-
-# Chimera workspace directories (for testing)
-chimera-*/
-
-# Binary
-chimera
-
-# Docker volumes and data
-docker-data/
-volumes/
-
-# Generated files
-*.generated.go
-
-# Dependency directories
-vendor/
-
-# Test cache
-.test-cache/
+repos/

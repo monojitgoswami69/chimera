@@ -1,622 +1,576 @@
 package cmd
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/projectchimera/chimera/internal/tui"
+	"chimera/internal/config"
+	"chimera/internal/llm"
+	"chimera/internal/ui"
+
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/spf13/cobra"
 )
 
-// setupCmd represents the setup command
 var setupCmd = &cobra.Command{
 	Use:   "setup",
-	Short: "Interactive setup wizard for Chimera configuration",
-	Long: `Launch an interactive setup wizard to configure Chimera's AI agent.
+	Short: "Configure your LLM provider and API key",
+	Long: `Interactive wizard to configure Chimera with your LLM provider, API key, and optional GitHub PAT.
 
-This wizard will guide you through:
-  1. Selecting an LLM provider (OpenAI, Gemini, Groq)
-  2. Entering your API key
-  3. Validating the API key
-  4. Selecting a model from available options
-  5. Saving configuration to ./.chimera.env (current directory)
+This creates ~/.chimera/.chimera.env with your configuration.
 
-After setup, Chimera will automatically use AI agent mode for smarter
-code analysis and configuration generation when run from this directory.
+Flags:
+  --force    Force reconfiguration even if config already exists
 
-Configuration priority:
-  1. Environment variables (highest)
-  2. ./.chimera.env (current directory)
-  3. ~/.chimera.env (home directory)
-
-Example:
-  chimera setup`,
-	RunE: runSetup,
+Examples:
+  chimera setup
+  chimera setup --force`,
+	Run: func(cmd *cobra.Command, args []string) {
+		runSetup()
+	},
 }
+
+var (
+	setupForce bool
+)
 
 func init() {
-	rootCmd.AddCommand(setupCmd)
+	setupCmd.Flags().BoolVar(&setupForce, "force", false, "Force reconfiguration even if config exists")
 }
 
-// runSetup executes the interactive setup wizard
-func runSetup(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
-	
-	tui.PrintBanner()
-	tui.PrintHeader("Chimera AI Configuration Wizard")
-	fmt.Println()
-	
-	tui.PrintInfo("This wizard will help you configure Chimera's AI agent for smarter")
-	tui.PrintInfo("code analysis and autonomous environment generation.")
-	fmt.Println()
-	
-	// Step 1: Select provider
-	provider := selectProvider()
-	if provider == "" {
-		return fmt.Errorf("setup cancelled")
+
+
+func runSetup() {
+	// Check if config already exists
+	if !setupForce {
+		configPath, _ := config.ConfigPath()
+		if _, err := os.Stat(configPath); err == nil {
+			// Config exists
+			fmt.Println(ui.Header("setup"))
+			fmt.Println(ui.WarningLine("Configuration already exists"))
+			fmt.Println()
+			fmt.Println(ui.InfoLine(fmt.Sprintf("Config file: %s", configPath)))
+			fmt.Println()
+			fmt.Println(ui.DimStyle.Render("To reconfigure, run:"))
+			fmt.Println(ui.HighlightStyle.Render("  chimera setup --force"))
+			fmt.Println()
+			return
+		}
 	}
-	
+
+	// Print banner once
+	fmt.Print(ui.Header("setup"))
+
+	// Step 1: Provider selection
+	fmt.Println(ui.BoldStyle.Render("Select LLM Provider:"))
 	fmt.Println()
 	
-	// Step 2: Enter API key
-	apiKey := enterAPIKey(provider)
+	providers := []string{"OpenAI", "Anthropic (Claude)", "Groq", "Google Gemini", "Ollama (local)"}
+	providerKeys := []string{"openai", "anthropic", "groq", "gemini", "ollama"}
+	
+	selectedProvider := selectFromList(providers)
+	if selectedProvider == -1 {
+		fmt.Println(ui.ErrorLine("Setup cancelled"))
+		return
+	}
+	provider := providerKeys[selectedProvider]
+	
+	fmt.Println(ui.SuccessLine(fmt.Sprintf("Selected: %s", providers[selectedProvider])))
+	fmt.Println()
+
+	// Step 2: API key entry
+	fmt.Println(ui.BoldStyle.Render(fmt.Sprintf("Enter your %s API key:", strings.Title(provider))))
+	fmt.Print("  ")
+	apiKey := readMaskedInput()
 	if apiKey == "" {
-		return fmt.Errorf("setup cancelled")
+		fmt.Println(ui.ErrorLine("API key cannot be empty"))
+		return
 	}
-	
+	fmt.Println(ui.SuccessLine("API key entered"))
 	fmt.Println()
-	tui.PrintInfo("Validating API key...")
+
+	// Step 3: Fetch models
+	fmt.Println(ui.SpinnerLine("⠹", fmt.Sprintf("Fetching available models from %s...", strings.Title(provider))))
 	
-	// Step 3: Validate API key and fetch models
-	models, err := fetchModels(ctx, provider, apiKey)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	
+	models, err := fetchModelsFromProvider(ctx, provider, apiKey)
+	var model string
+	
 	if err != nil {
-		tui.PrintError(fmt.Sprintf("Failed to validate API key: %v", err))
-		return fmt.Errorf("setup: API key validation failed")
+		fmt.Println(ui.WarningLine(fmt.Sprintf("Failed to fetch models: %v", err)))
+		fmt.Println()
+		fmt.Println(ui.BoldStyle.Render("Enter model name manually:"))
+		fmt.Print("  ")
+		model = readInput()
+		if model == "" {
+			fmt.Println(ui.ErrorLine("Model name cannot be empty"))
+			return
+		}
+	} else {
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Fetched %d models", len(models))))
+		fmt.Println()
+		
+		// Step 4: Model selection
+		fmt.Println(ui.BoldStyle.Render("Select Model:"))
+		fmt.Println()
+		
+		// Mark recommended models
+		displayModels := make([]string, len(models))
+		for i, m := range models {
+			if isRecommendedModel(provider, m) {
+				displayModels[i] = "★ " + m
+			} else {
+				displayModels[i] = m
+			}
+		}
+		
+		selectedModel := selectFromList(displayModels)
+		if selectedModel == -1 {
+			fmt.Println(ui.ErrorLine("Setup cancelled"))
+			return
+		}
+		model = models[selectedModel]
+		
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Selected: %s", model)))
+		fmt.Println()
+	}
+
+	// Step 5: Verify connection prompt
+	fmt.Println(ui.BoldStyle.Render("Verify connection with a test message?"))
+	fmt.Println()
+	
+	verifyChoice := selectFromList([]string{"Yes", "No"})
+	if verifyChoice == -1 {
+		fmt.Println(ui.ErrorLine("Setup cancelled"))
+		return
 	}
 	
-	tui.PrintSuccess("API key validated successfully!")
+	fmt.Println(ui.SuccessLine([]string{"Yes", "No"}[verifyChoice]))
+	fmt.Println()
+
+	if verifyChoice == 0 {
+		// Step 6: Verify connection
+		fmt.Println(ui.SpinnerLine("⠸", fmt.Sprintf("Sending ping to %s/%s...", strings.Title(provider), model)))
+		
+		llmClient, err := llm.NewClient(provider, model, apiKey)
+		if err != nil {
+			fmt.Println(ui.ErrorLine(fmt.Sprintf("Failed to create client: %v", err)))
+			fmt.Println()
+			
+			retryChoice := selectFromList([]string{"Change model", "Re-enter API key", "Skip verification"})
+			if retryChoice == 0 {
+				fmt.Println(ui.InfoLine("Please restart setup to change model"))
+				return
+			} else if retryChoice == 1 {
+				fmt.Println(ui.InfoLine("Please restart setup to re-enter API key"))
+				return
+			}
+			// Skip verification
+		} else {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			
+			_, err = llmClient.Call(ctx, "You are a helpful assistant.", "ping")
+			if err != nil {
+				fmt.Println(ui.ErrorLine(fmt.Sprintf("Connection failed: %v", err)))
+				fmt.Println()
+				
+				retryChoice := selectFromList([]string{"Change model", "Re-enter API key", "Skip verification"})
+				if retryChoice == 0 || retryChoice == 1 {
+					fmt.Println(ui.InfoLine("Please restart setup"))
+					return
+				}
+				// Skip verification
+			} else {
+				fmt.Println(ui.SuccessLine("Connection verified"))
+				fmt.Println()
+			}
+		}
+	}
+
+	// Step 7: GitHub PAT prompt
+	fmt.Println(ui.BoldStyle.Render("Add GitHub Personal Access Token for private repos?"))
 	fmt.Println()
 	
-	// Step 4: Select model
-	selectedModel := selectModel(provider, models)
-	if selectedModel == "" {
-		return fmt.Errorf("setup cancelled")
+	patChoice := selectFromList([]string{"Yes", "No"})
+	if patChoice == -1 {
+		fmt.Println(ui.ErrorLine("Setup cancelled"))
+		return
 	}
 	
+	fmt.Println(ui.SuccessLine([]string{"Yes", "No"}[patChoice]))
 	fmt.Println()
-	
-	// Step 5: Save configuration
-	if err := saveConfig(provider, apiKey, selectedModel); err != nil {
-		tui.PrintError(fmt.Sprintf("Failed to save configuration: %v", err))
-		return fmt.Errorf("setup: failed to save config")
+
+	var githubPAT string
+	if patChoice == 0 {
+		fmt.Println(ui.DimStyle.Render("  Your PAT needs 'repo' scope. Generate one at:"))
+		fmt.Println("  " + ui.HighlightStyle.Render("https://github.com/settings/tokens"))
+		fmt.Println()
+		fmt.Println(ui.BoldStyle.Render("Enter GitHub PAT:"))
+		fmt.Print("  ")
+		githubPAT = readMaskedInput()
+		
+		if githubPAT != "" && !strings.HasPrefix(githubPAT, "ghp_") && !strings.HasPrefix(githubPAT, "github_pat_") {
+			fmt.Println(ui.WarningLine("Warning: PAT should start with ghp_ or github_pat_"))
+			fmt.Println()
+		} else if githubPAT != "" {
+			fmt.Println(ui.SuccessLine("GitHub PAT entered"))
+			fmt.Println()
+		}
 	}
+
+	// Step 8: Save configuration
+	fmt.Println(ui.SpinnerLine("⠹", "Saving configuration..."))
 	
+	cfg := &config.Config{
+		LLMProvider: provider,
+		LLMModel:    model,
+		LLMAPIKey:   apiKey,
+		GitHubPAT:   githubPAT,
+	}
+
+	if err := config.Save(cfg); err != nil {
+		fmt.Println(ui.ErrorLine(fmt.Sprintf("Failed to save config: %v", err)))
+		return
+	}
+
+	configPath, _ := config.ConfigPath()
+	fmt.Println(ui.SuccessLine(fmt.Sprintf("Config written to %s", configPath)))
 	fmt.Println()
-	tui.PrintSuccess("✓ Setup complete!")
+
+	// Step 9: Completion
+	completionMsg := fmt.Sprintf(
+		"Chimera is ready.\n\n"+
+			"Provider: %s · Model: %s\n\n"+
+			"Run  chimera init <github-url>  to get started.",
+		ui.HighlightStyle.Render(strings.Title(provider)),
+		ui.HighlightStyle.Render(model),
+	)
+
+	box := ui.SuccessBox.Render(completionMsg)
+	fmt.Println(box)
 	fmt.Println()
-	
-	cwd, _ := os.Getwd()
-	configPath := filepath.Join(cwd, ".chimera.env")
-	fmt.Println("Configuration saved to:", configPath)
-	fmt.Println()
-	fmt.Println("You can now use Chimera with AI agent mode:")
-	fmt.Println("  chimera init <github-repo-url>")
-	fmt.Println()
-	fmt.Println("Note: The .chimera.env file is in your current directory.")
-	fmt.Println("      Run chimera commands from this directory to use this config.")
-	fmt.Println()
-	
+}
+
+// selectorModel is a simple Bubble Tea model for interactive list selection
+type selectorModel struct {
+	cursor int
+	items  []string
+	done   bool
+	choice int
+}
+
+// selectFromList shows an interactive list and returns the selected index (-1 if cancelled)
+func selectFromList(items []string) int {
+	m := selectorModel{items: items, choice: -1}
+
+	p := tea.NewProgram(m)
+	result, err := p.Run()
+	if err != nil {
+		return -1
+	}
+
+	return result.(selectorModel).choice
+}
+
+// Init for the selector
+func (m selectorModel) Init() tea.Cmd {
 	return nil
 }
 
-// selectProvider prompts user to select an LLM provider
-func selectProvider() string {
-	tui.PrintSubheader("STEP 1: Select LLM Provider")
-	tui.PrintDivider()
-	fmt.Println()
-	fmt.Println(tui.BoldStyle.Render("  Available providers:"))
-	fmt.Println()
-	fmt.Println(tui.InfoStyle.Render("  1. OpenAI"))
-	tui.PrintListItem("Models: GPT-4o, GPT-4o-mini, GPT-4-turbo")
-	tui.PrintListItem("Best for: General purpose, high quality")
-	tui.PrintListItem("Get API key: https://platform.openai.com/api-keys")
-	tui.PrintListItem("Recommended: ⭐ GPT-4o-mini (fast, cost-effective)")
-	fmt.Println()
-	fmt.Println(tui.InfoStyle.Render("  2. Google Gemini"))
-	tui.PrintListItem("Models: Gemini 2.0 Flash, Gemini 1.5 Pro")
-	tui.PrintListItem("Best for: Fast responses, large context")
-	tui.PrintListItem("Get API key: https://aistudio.google.com/apikey")
-	tui.PrintListItem("Recommended: ⭐ Gemini 2.0 Flash (fastest)")
-	fmt.Println()
-	fmt.Println(tui.InfoStyle.Render("  3. Groq"))
-	tui.PrintListItem("Models: Llama 3.1 70B, Mixtral 8x7B")
-	tui.PrintListItem("Best for: Ultra-fast inference, open models")
-	tui.PrintListItem("Get API key: https://console.groq.com/keys")
-	tui.PrintListItem("Recommended: ⭐ Llama 3.1 70B (powerful, fast)")
-	fmt.Println()
-	
-	reader := bufio.NewReader(os.Stdin)
-	
-	for {
-		fmt.Print("Select provider (1-3) or 'q' to quit: ")
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-		
-		switch input {
-		case "1":
-			return "openai"
-		case "2":
-			return "gemini"
-		case "3":
-			return "groq"
-		case "q", "Q":
-			return ""
-		default:
-			tui.PrintWarning("Invalid selection. Please enter 1, 2, 3, or 'q'")
+// Update for the selector
+func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			m.done = true
+			m.choice = -1
+			return m, tea.Quit
+		case "up", "k":
+			if m.cursor > 0 {
+				m.cursor--
+			}
+		case "down", "j":
+			if m.cursor < len(m.items)-1 {
+				m.cursor++
+			}
+		case "enter":
+			m.done = true
+			m.choice = m.cursor
+			return m, tea.Quit
 		}
 	}
+	return m, nil
 }
 
-// enterAPIKey prompts user to enter their API key
-func enterAPIKey(provider string) string {
-	tui.PrintSubheader("STEP 2: Enter API Key")
-	tui.PrintDivider()
-	fmt.Println()
-	
-	var keyURL string
-	switch provider {
-	case "openai":
-		keyURL = "https://platform.openai.com/api-keys"
-		fmt.Println("Get your OpenAI API key from:", keyURL)
-		fmt.Println("Format: sk-...")
-	case "gemini":
-		keyURL = "https://aistudio.google.com/apikey"
-		fmt.Println("Get your Gemini API key from:", keyURL)
-	case "groq":
-		keyURL = "https://console.groq.com/keys"
-		fmt.Println("Get your Groq API key from:", keyURL)
-		fmt.Println("Format: gsk_...")
+// View for the selector
+func (m selectorModel) View() string {
+	if m.done {
+		return ""
 	}
-	
-	fmt.Println()
-	
-	reader := bufio.NewReader(os.Stdin)
-	
-	for {
-		fmt.Print("Enter your API key (or 'q' to quit): ")
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-		
-		if input == "q" || input == "Q" {
-			return ""
+
+	var b strings.Builder
+	for i, item := range m.items {
+		cursor := " "
+		if m.cursor == i {
+			cursor = ui.PrimaryStyle.Render("●")
+			item = ui.PrimaryStyle.Render(item)
+		} else {
+			item = ui.MutedStyle.Render(item)
 		}
-		
-		if len(input) < 10 {
-			tui.PrintWarning("API key seems too short. Please check and try again.")
-			continue
-		}
-		
-		return input
+		b.WriteString(fmt.Sprintf("  %s %s\n", cursor, item))
 	}
+	b.WriteString("\n")
+	b.WriteString(ui.DimStyle.Render("Use ↑/↓ to navigate, Enter to select, q to quit"))
+	return b.String()
 }
 
-// fetchModels fetches available models from the provider
-func fetchModels(ctx context.Context, provider, apiKey string) ([]ModelInfo, error) {
+// readInput reads a line of input
+func readInput() string {
+	var input string
+	fmt.Scanln(&input)
+	return strings.TrimSpace(input)
+}
+
+// readMaskedInput reads input without echoing (for passwords)
+func readMaskedInput() string {
+	// For simplicity, we'll use a basic approach
+	// In production, you'd want to use golang.org/x/term for proper masking
+	var input string
+	fmt.Scanln(&input)
+	return strings.TrimSpace(input)
+}
+
+func fetchModelsFromProvider(ctx context.Context, provider, apiKey string) ([]string, error) {
 	switch provider {
 	case "openai":
 		return fetchOpenAIModels(ctx, apiKey)
-	case "gemini":
-		return getGeminiModels(), nil
+	case "anthropic":
+		return getAnthropicModels(), nil
 	case "groq":
 		return fetchGroqModels(ctx, apiKey)
+	case "gemini":
+		return fetchGeminiModels(ctx, apiKey)
+	case "ollama":
+		return fetchOllamaModels(ctx)
 	default:
 		return nil, fmt.Errorf("unsupported provider: %s", provider)
 	}
 }
 
-// ModelInfo represents a model with metadata
-type ModelInfo struct {
-	ID          string
-	Name        string
-	Description string
-	Recommended bool
-}
-
-// fetchOpenAIModels fetches available models from OpenAI
-func fetchOpenAIModels(ctx context.Context, apiKey string) ([]ModelInfo, error) {
+func fetchOpenAIModels(ctx context.Context, apiKey string) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.openai.com/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to OpenAI: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("OpenAI API error (status %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
 	}
-	
+
 	var result struct {
 		Data []struct {
-			ID      string `json:"id"`
-			Created int64  `json:"created"`
+			ID string `json:"id"`
 		} `json:"data"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, err
 	}
-	
-	// Filter for chat/completion models and add metadata
-	models := []ModelInfo{}
-	modelPriority := map[string]int{
-		"gpt-4o":          1,
-		"gpt-4o-mini":     2,
-		"gpt-4-turbo":     3,
-		"gpt-4":           4,
-		"gpt-3.5-turbo":   5,
-	}
-	
-	modelDescriptions := map[string]string{
-		"gpt-4o":          "Most capable model, multimodal, best quality",
-		"gpt-4o-mini":     "Fast and cost-effective, great for most tasks",
-		"gpt-4-turbo":     "Previous generation, still very capable",
-		"gpt-4":           "Original GPT-4, reliable",
-		"gpt-3.5-turbo":   "Fastest, lowest cost",
-	}
-	
-	seenModels := make(map[string]bool)
-	
-	for _, model := range result.Data {
-		// Only include chat/completion models
-		if !strings.Contains(model.ID, "gpt") {
-			continue
+
+	// Filter to chat models only
+	var models []string
+	for _, m := range result.Data {
+		if strings.Contains(m.ID, "gpt") && !strings.Contains(m.ID, "instruct") {
+			models = append(models, m.ID)
 		}
-		
-		// Skip embeddings, whisper, tts, dall-e, etc.
-		if strings.Contains(model.ID, "embed") || 
-		   strings.Contains(model.ID, "whisper") ||
-		   strings.Contains(model.ID, "tts") ||
-		   strings.Contains(model.ID, "dall-e") ||
-		   strings.Contains(model.ID, "babbage") ||
-		   strings.Contains(model.ID, "davinci") ||
-		   strings.Contains(model.ID, "instruct") {
-			continue
+	}
+
+	// Sort with recommended first
+	sortedModels := []string{}
+	recommended := []string{"gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"}
+	for _, r := range recommended {
+		for _, m := range models {
+			if m == r {
+				sortedModels = append(sortedModels, m)
+			}
 		}
-		
-		// Get base model name (without date suffixes)
-		baseModel := model.ID
-		for prefix := range modelPriority {
-			if strings.HasPrefix(model.ID, prefix) {
-				baseModel = prefix
+	}
+
+	// Add remaining models
+	for _, m := range models {
+		found := false
+		for _, s := range sortedModels {
+			if s == m {
+				found = true
 				break
 			}
 		}
-		
-		// Skip if we've already added this base model
-		if seenModels[baseModel] {
-			continue
+		if !found {
+			sortedModels = append(sortedModels, m)
 		}
-		seenModels[baseModel] = true
-		
-		description := modelDescriptions[baseModel]
-		if description == "" {
-			description = "OpenAI language model"
-		}
-		
-		models = append(models, ModelInfo{
-			ID:          model.ID,
-			Name:        formatModelName(model.ID),
-			Description: description,
-			Recommended: baseModel == "gpt-4o-mini",
-		})
 	}
-	
-	// Sort by priority
-	sortModelsByPriority(models, modelPriority)
-	
-	// If no models found, return error
-	if len(models) == 0 {
-		return nil, fmt.Errorf("no compatible models found in your OpenAI account")
-	}
-	
-	return models, nil
+
+	return sortedModels, nil
 }
 
-// getGeminiModels returns available Gemini models by querying the API
-func getGeminiModels() []ModelInfo {
-	// Gemini doesn't have a models list endpoint that works without complex auth
-	// Return known available models
-	return []ModelInfo{
-		{
-			ID:          "gemini-2.0-flash-exp",
-			Name:        "Gemini 2.0 Flash (Experimental)",
-			Description: "Latest model, fastest responses, experimental features",
-			Recommended: true,
-		},
-		{
-			ID:          "gemini-1.5-flash",
-			Name:        "Gemini 1.5 Flash",
-			Description: "Stable, fast, good quality, 1M token context",
-			Recommended: false,
-		},
-		{
-			ID:          "gemini-1.5-flash-8b",
-			Name:        "Gemini 1.5 Flash 8B",
-			Description: "Smaller, faster, cost-effective",
-			Recommended: false,
-		},
-		{
-			ID:          "gemini-1.5-pro",
-			Name:        "Gemini 1.5 Pro",
-			Description: "Most capable, 2M token context, best quality",
-			Recommended: false,
-		},
+func getAnthropicModels() []string {
+	// Anthropic doesn't expose a public models endpoint
+	return []string{
+		"claude-sonnet-4",
+		"claude-3-5-sonnet-20241022",
+		"claude-3-opus-20240229",
+		"claude-3-sonnet-20240229",
+		"claude-3-haiku-20240307",
 	}
 }
 
-// fetchGroqModels fetches available models from Groq
-func fetchGroqModels(ctx context.Context, apiKey string) ([]ModelInfo, error) {
+func fetchGroqModels(ctx context.Context, apiKey string) ([]string, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.groq.com/openai/v1/models", nil)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("failed to connect to Groq: %w", err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("Groq API error (status %d): %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
 	}
-	
+
 	var result struct {
 		Data []struct {
-			ID      string `json:"id"`
-			OwnedBy string `json:"owned_by"`
-			Active  bool   `json:"active"`
+			ID string `json:"id"`
 		} `json:"data"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+		return nil, err
 	}
-	
-	// Build models list with metadata
-	models := []ModelInfo{}
-	modelPriority := map[string]int{
-		"llama-3.3-70b-versatile":    1,
-		"llama-3.1-70b-versatile":    2,
-		"llama-3.2-90b-vision-preview": 3,
-		"mixtral-8x7b-32768":         4,
-		"llama-3.1-8b-instant":       5,
-		"gemma2-9b-it":               6,
+
+	var models []string
+	for _, m := range result.Data {
+		models = append(models, m.ID)
 	}
-	
-	modelDescriptions := map[string]string{
-		"llama-3.3-70b-versatile":    "Latest Llama 3.3, most capable, best quality",
-		"llama-3.1-70b-versatile":    "Llama 3.1 70B, powerful and reliable",
-		"llama-3.2-90b-vision-preview": "Llama 3.2 with vision, multimodal",
-		"mixtral-8x7b-32768":         "Mixtral MoE, fast, 32K context",
-		"llama-3.1-8b-instant":       "Llama 3.1 8B, ultra-fast, good for simple tasks",
-		"gemma2-9b-it":               "Google Gemma 2, efficient",
-		"llama-3.2-11b-vision-preview": "Llama 3.2 11B with vision",
-		"llama-3.2-3b-preview":       "Llama 3.2 3B, very fast",
-		"llama-3.2-1b-preview":       "Llama 3.2 1B, fastest",
-	}
-	
-	for _, model := range result.Data {
-		// Skip inactive models
-		if !model.Active {
-			continue
-		}
-		
-		// Only include models we know about or that look like chat models
-		description := modelDescriptions[model.ID]
-		if description == "" {
-			// Try to infer description
-			if strings.Contains(model.ID, "llama") {
-				description = "Llama language model"
-			} else if strings.Contains(model.ID, "mixtral") {
-				description = "Mixtral mixture-of-experts model"
-			} else if strings.Contains(model.ID, "gemma") {
-				description = "Google Gemma model"
-			} else {
-				description = "Language model"
-			}
-		}
-		
-		models = append(models, ModelInfo{
-			ID:          model.ID,
-			Name:        formatModelName(model.ID),
-			Description: description,
-			Recommended: model.ID == "llama-3.3-70b-versatile" || model.ID == "llama-3.1-70b-versatile",
-		})
-	}
-	
-	// Sort by priority
-	sortModelsByPriority(models, modelPriority)
-	
-	// If no models found, return error
-	if len(models) == 0 {
-		return nil, fmt.Errorf("no compatible models found in your Groq account")
-	}
-	
+
 	return models, nil
 }
 
-// formatModelName converts model ID to a human-readable name
-func formatModelName(id string) string {
-	// Remove common suffixes
-	name := strings.TrimSuffix(id, "-preview")
-	name = strings.TrimSuffix(name, "-latest")
-	
-	// Capitalize and format
-	parts := strings.Split(name, "-")
-	for i, part := range parts {
-		if len(part) > 0 {
-			// Keep version numbers and special terms lowercase
-			if part == "it" || part == "instruct" || part == "chat" {
-				continue
-			}
-			// Capitalize first letter
-			parts[i] = strings.ToUpper(part[:1]) + part[1:]
-		}
-	}
-	
-	return strings.Join(parts, " ")
-}
-
-// sortModelsByPriority sorts models based on priority map
-func sortModelsByPriority(models []ModelInfo, priority map[string]int) {
-	// Simple bubble sort based on priority
-	for i := 0; i < len(models); i++ {
-		for j := i + 1; j < len(models); j++ {
-			iPriority := priority[models[i].ID]
-			jPriority := priority[models[j].ID]
-			
-			// If not in priority map, assign high number
-			if iPriority == 0 {
-				iPriority = 999
-			}
-			if jPriority == 0 {
-				jPriority = 999
-			}
-			
-			if iPriority > jPriority {
-				models[i], models[j] = models[j], models[i]
-			}
-		}
-	}
-}
-
-// selectModel prompts user to select a model
-func selectModel(provider string, models []ModelInfo) string {
-	tui.PrintSubheader("STEP 3: Select Model")
-	tui.PrintDivider()
-	fmt.Println()
-	fmt.Println(tui.BoldStyle.Render("  Available models:"))
-	fmt.Println()
-	
-	for i, model := range models {
-		prefix := fmt.Sprintf("  %d. %s", i+1, model.Name)
-		if model.Recommended {
-			prefix += " ⭐ RECOMMENDED"
-		}
-		fmt.Println(prefix)
-		fmt.Printf("     %s\n", model.Description)
-		fmt.Printf("     ID: %s\n", model.ID)
-		fmt.Println()
-	}
-	
-	reader := bufio.NewReader(os.Stdin)
-	
-	for {
-		fmt.Printf("Select model (1-%d) or 'q' to quit: ", len(models))
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
-		
-		if input == "q" || input == "Q" {
-			return ""
-		}
-		
-		var selection int
-		if _, err := fmt.Sscanf(input, "%d", &selection); err == nil {
-			if selection >= 1 && selection <= len(models) {
-				return models[selection-1].ID
-			}
-		}
-		
-		tui.PrintWarning(fmt.Sprintf("Invalid selection. Please enter 1-%d or 'q'", len(models)))
-	}
-}
-
-// saveConfig saves the configuration to ./.chimera.env (current directory)
-func saveConfig(provider, apiKey, model string) error {
-	// Get current working directory
-	cwd, err := os.Getwd()
+func fetchGeminiModels(ctx context.Context, apiKey string) ([]string, error) {
+	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s", apiKey)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return fmt.Errorf("failed to get current directory: %w", err)
+		return nil, err
 	}
-	
-	configPath := filepath.Join(cwd, ".chimera.env")
-	
-	// Read existing config if it exists
-	existingConfig := make(map[string]string)
-	if data, err := os.ReadFile(configPath); err == nil {
-		lines := strings.Split(string(data), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			parts := strings.SplitN(line, "=", 2)
-			if len(parts) == 2 {
-				existingConfig[parts[0]] = parts[1]
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	var models []string
+	for _, m := range result.Models {
+		// Extract model ID from name (e.g., "models/gemini-pro" -> "gemini-pro")
+		parts := strings.Split(m.Name, "/")
+		if len(parts) > 1 {
+			modelID := parts[len(parts)-1]
+			// Filter to generative models only
+			if strings.Contains(modelID, "gemini") && !strings.Contains(modelID, "embedding") {
+				models = append(models, modelID)
 			}
 		}
 	}
-	
-	// Update with new values
-	existingConfig["CHIMERA_LLM_PROVIDER"] = provider
-	existingConfig["CHIMERA_MODEL"] = model
-	
-	switch provider {
-	case "openai":
-		existingConfig["OPENAI_API_KEY"] = apiKey
-	case "gemini":
-		existingConfig["GEMINI_API_KEY"] = apiKey
-	case "groq":
-		existingConfig["GROQ_API_KEY"] = apiKey
+
+	return models, nil
+}
+
+func fetchOllamaModels(ctx context.Context) ([]string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "http://localhost:11434/api/tags", nil)
+	if err != nil {
+		return nil, err
 	}
-	
-	// Write config file
-	var content strings.Builder
-	content.WriteString("# Chimera Configuration\n")
-	content.WriteString("# Generated by: chimera setup\n")
-	content.WriteString(fmt.Sprintf("# Date: %s\n\n", time.Now().Format("2006-01-02 15:04:05")))
-	
-	content.WriteString("# LLM Provider Configuration\n")
-	content.WriteString(fmt.Sprintf("CHIMERA_LLM_PROVIDER=%s\n", existingConfig["CHIMERA_LLM_PROVIDER"]))
-	content.WriteString(fmt.Sprintf("CHIMERA_MODEL=%s\n\n", existingConfig["CHIMERA_MODEL"]))
-	
-	content.WriteString("# API Keys\n")
-	if val, ok := existingConfig["OPENAI_API_KEY"]; ok {
-		content.WriteString(fmt.Sprintf("OPENAI_API_KEY=%s\n", val))
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Ollama not running or not accessible at localhost:11434")
 	}
-	if val, ok := existingConfig["GEMINI_API_KEY"]; ok {
-		content.WriteString(fmt.Sprintf("GEMINI_API_KEY=%s\n", val))
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Ollama API error (%d)", resp.StatusCode)
 	}
-	if val, ok := existingConfig["GROQ_API_KEY"]; ok {
-		content.WriteString(fmt.Sprintf("GROQ_API_KEY=%s\n", val))
+
+	var result struct {
+		Models []struct {
+			Name string `json:"name"`
+		} `json:"models"`
 	}
-	
-	// Add GitHub token if it exists
-	if val, ok := existingConfig["GITHUB_TOKEN"]; ok {
-		content.WriteString(fmt.Sprintf("\n# GitHub Access\nGITHUB_TOKEN=%s\n", val))
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
 	}
-	
-	return os.WriteFile(configPath, []byte(content.String()), 0600)
+
+	var models []string
+	for _, m := range result.Models {
+		models = append(models, m.Name)
+	}
+
+	return models, nil
+}
+
+func isRecommendedModel(provider, model string) bool {
+	recommended := map[string][]string{
+		"openai":    {"gpt-4o", "gpt-4-turbo"},
+		"anthropic": {"claude-sonnet-4", "claude-3-5-sonnet-20241022"},
+		"groq":      {"llama3-70b-8192", "mixtral-8x7b-32768"},
+		"gemini":    {"gemini-1.5-pro", "gemini-pro"},
+		"ollama":    {"llama2", "mistral"},
+	}
+
+	for _, r := range recommended[provider] {
+		if model == r {
+			return true
+		}
+	}
+	return false
 }

@@ -2,59 +2,52 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 
-	"github.com/projectchimera/chimera/internal/agent"
-	"github.com/projectchimera/chimera/internal/tui"
 	"github.com/spf13/cobra"
 )
 
 var (
 	// Version is set during build via ldflags
-	Version = "dev"
+	Version = "v0.1.0"
 	// BuildTime is set during build via ldflags
 	BuildTime = "unknown"
 )
 
-// rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:   "chimera",
-	Short: "Chimera - Autonomous local development environment provisioner",
-	Long: `Chimera is a developer CLI tool that autonomously clones a GitHub repository,
-analyzes its infrastructure dependencies, and provisions a fully containerized
-local development environment — all with zero manual configuration.
-
-Run 'chimera init <github-url>' to get a running local environment in under 2 minutes.`,
+	Short: "Autonomous environment orchestration for any GitHub repository",
+	Long:  `Chimera autonomously clones, analyzes, and generates Docker configurations for GitHub repositories.`,
 	Version: Version,
-	// Uncomment the following line if your bare application has an action associated with it:
-	// Run: func(cmd *cobra.Command, args []string) { },
+	Run: func(cmd *cobra.Command, args []string) {
+		showHelp()
+	},
 }
 
-// Execute adds all child commands to the root command and sets flags appropriately.
-// This is called by main.main(). It only needs to happen once to the rootCmd.
-func Execute() error {
-	return rootCmd.Execute()
+func Execute() {
+	// Disable default completion command
+	rootCmd.CompletionOptions.DisableDefaultCmd = true
+	
+	if err := rootCmd.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
 func init() {
-	// Load .chimera.env config files (~/.chimera.env and ./.chimera.env)
-	agent.LoadConfig()
-
-	// Global flags can be added here
-	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output")
+	// Disable auto-generated help command (we have our own)
+	rootCmd.SetHelpCommand(&cobra.Command{Hidden: true})
+	
+	// Global flags
+	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output (show LLM responses, detailed logs)")
 	rootCmd.PersistentFlags().BoolP("quiet", "q", false, "Suppress non-error output")
-
+	
 	// Set custom version template
 	rootCmd.SetVersionTemplate(fmt.Sprintf("Chimera %s (built %s)\n", Version, BuildTime))
-
-	// Set custom help function to inject ASCII banner
-	defaultHelpFunc := rootCmd.HelpFunc()
-	rootCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
-		// Only print banner for the root command help
-		if cmd.Name() == "chimera" {
-			tui.PrintBanner()
-		}
-		defaultHelpFunc(cmd, args)
-	})
+	
+	rootCmd.AddCommand(helpCmd)
+	rootCmd.AddCommand(setupCmd)
+	rootCmd.AddCommand(initCmd)
 }
 
 // GetVerbose returns whether verbose mode is enabled
