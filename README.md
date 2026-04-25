@@ -78,11 +78,34 @@ make build
 make install
 ```
 
+### Setup AI Agent (Recommended)
+
+Run the interactive setup wizard to configure AI-powered analysis:
+
+```bash
+./build/chimera setup
+```
+
+The wizard will:
+1. Help you select an LLM provider (OpenAI, Gemini, or Groq)
+2. Validate your API key
+3. Let you choose from available models
+4. Save configuration to `.chimera.env` in the current directory
+
 ### Basic Usage
 
 ```bash
 # Initialize a new environment from any GitHub repository
 chimera init https://github.com/user/repo
+
+# With Docker execution
+chimera init https://github.com/user/repo --docker-run
+
+# With reverse proxy
+chimera init https://github.com/user/repo --docker-run --create-proxy
+
+# Without AI agent (template-based)
+chimera init https://github.com/user/repo --no-agent
 
 # View live container statistics
 chimera stats
@@ -96,6 +119,25 @@ chimera nuke
 
 ## 📖 Detailed Usage
 
+### `chimera setup`
+
+Interactive setup wizard for configuring AI agent.
+
+```bash
+chimera setup
+```
+
+**What it does:**
+- Guides you through provider selection (OpenAI, Gemini, Groq)
+- Validates your API key by fetching available models
+- Lets you select a model with recommendations
+- Saves configuration to `./.chimera.env`
+
+**Configuration Priority:**
+1. Environment variables (highest priority)
+2. `./.chimera.env` (current directory)
+3. `~/.chimera.env` (home directory)
+
 ### `chimera init`
 
 Initialize a fully functional development environment from a GitHub repository.
@@ -104,19 +146,40 @@ Initialize a fully functional development environment from a GitHub repository.
 chimera init <github-repo-url> [flags]
 
 Flags:
-  --cwd string       Working directory for the workspace (default: ./chimera-<repo-name>)
-  --force            Force re-initialization even if workspace exists
-  --no-proxy         Skip Caddy proxy and /etc/hosts setup
-  --agent            Use AI agent for smarter config generation
-  -v, --verbose      Enable verbose output
-  -q, --quiet        Suppress non-error output
+  --cwd string         Working directory for the workspace (default: ./chimera-<repo-name>)
+  --force              Force re-initialization even if workspace exists
+  --docker-run         Start Docker containers after generating configs
+  --create-proxy       Set up Caddy reverse proxy and /etc/hosts entry
+  --no-agent           Disable AI agent (use template-based generation)
+  -v, --verbose        Enable verbose output
+  -q, --quiet          Suppress non-error output
 ```
+
+**Default Behavior (without flags):**
+- Uses AI agent mode (if configured via `chimera setup`)
+- Generates configuration files only (no Docker execution)
+- No reverse proxy setup
+- Creates `quick_start_guide.txt` with detailed instructions
+
+**If AI agent is not configured:**
+- Automatically falls back to template-based generation
+- Displays a message suggesting to run `chimera setup`
+- Still generates working configurations
 
 **Examples:**
 
 ```bash
-# Basic initialization
+# Basic initialization (generates files only)
 chimera init https://github.com/user/my-app
+
+# Generate and start Docker containers
+chimera init https://github.com/user/my-app --docker-run
+
+# Full setup with proxy and Docker
+chimera init https://github.com/user/my-app --docker-run --create-proxy
+
+# Template-based (no AI)
+chimera init https://github.com/user/my-app --no-agent
 
 # Private repository (requires GITHUB_TOKEN or SSH)
 export GITHUB_TOKEN=ghp_xxxxx
@@ -124,23 +187,17 @@ chimera init https://github.com/user/private-repo
 
 # Custom workspace directory
 chimera init https://github.com/user/repo --cwd ./my-workspace
-
-# Skip reverse proxy setup
-chimera init https://github.com/user/repo --no-proxy
-
-# Use AI agent for enhanced config generation
-chimera init https://github.com/user/repo --agent
 ```
 
 **What happens during init:**
 
 1. ✅ Clones the repository (supports private repos via `GITHUB_TOKEN` or SSH)
-2. ✅ Scans for languages, dependencies, and environment variables
-3. ✅ Generates `docker-compose.yml`, `Dockerfile`, and `.env.example`
+2. ✅ Scans for languages, dependencies, and environment variables (supports monorepos)
+3. ✅ Generates `docker-compose.yml`, `Dockerfile`, `.env.example`, and `quick_start_guide.txt`
 4. ✅ Resolves port conflicts automatically
-5. ✅ Sets up Caddy reverse proxy and local domain
-6. ✅ Starts all containers with health checks
-7. ✅ Watches for failures and triggers AI diagnostics
+5. ✅ Optionally sets up Caddy reverse proxy and local domain (with `--create-proxy`)
+6. ✅ Optionally starts all containers with health checks (with `--docker-run`)
+7. ✅ Watches for failures and triggers AI diagnostics (when Docker is running)
 
 ### `chimera stats`
 

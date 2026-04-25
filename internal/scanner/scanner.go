@@ -60,6 +60,7 @@ type Scanner struct {
 // ScanResult contains the results of a repository scan
 type ScanResult struct {
 	Languages      []Language
+	Frameworks     []FrameworkInfo
 	Infrastructure []Infrastructure
 	EnvVars        []string // Only variable names, never values (security requirement)
 	Ports          []int
@@ -91,6 +92,7 @@ func NewScanner(workspaceDir string) *Scanner {
 func (s *Scanner) Scan(ctx context.Context) (*ScanResult, error) {
 	result := &ScanResult{
 		Languages:      make([]Language, 0),
+		Frameworks:     make([]FrameworkInfo, 0),
 		Infrastructure: make([]Infrastructure, 0),
 		EnvVars:        make([]string, 0),
 		Ports:          make([]int, 0),
@@ -200,6 +202,9 @@ func (s *Scanner) scanLanguages(ctx context.Context, result *ScanResult) error {
 			Version: version,
 			Files:   nodeFiles,
 		})
+		if f := s.detectNodeFrameworks(s.workspaceDir); f != nil {
+			result.Frameworks = append(result.Frameworks, *f)
+		}
 	}
 
 	if len(pythonFiles) > 0 {
@@ -209,6 +214,9 @@ func (s *Scanner) scanLanguages(ctx context.Context, result *ScanResult) error {
 			Version: version,
 			Files:   pythonFiles,
 		})
+		if f := s.detectPythonFramework(s.workspaceDir); f != nil {
+			result.Frameworks = append(result.Frameworks, *f)
+		}
 	}
 
 	if len(goFiles) > 0 {
@@ -218,6 +226,9 @@ func (s *Scanner) scanLanguages(ctx context.Context, result *ScanResult) error {
 			Version: version,
 			Files:   goFiles,
 		})
+		if f := s.detectGoFramework(s.workspaceDir); f != nil {
+			result.Frameworks = append(result.Frameworks, *f)
+		}
 	}
 
 	return nil

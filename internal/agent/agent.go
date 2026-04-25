@@ -23,11 +23,11 @@ import (
 	"github.com/projectchimera/chimera/internal/tui"
 )
 
-// maxFileSize limits individual files sent to the LLM (32KB).
-const maxFileSize = 32 * 1024
+// maxFileSize limits individual files sent to the LLM. Reduced to 12KB to avoid token limits.
+const maxFileSize = 12 * 1024
 
 // maxFiles limits how many files the LLM can request.
-const maxFiles = 20
+const maxFiles = 10
 
 // maxTreeDepth limits directory tree depth.
 const maxTreeDepth = 5
@@ -71,6 +71,12 @@ type Provider struct {
 // Run executes the full agentic pipeline.
 // Returns a Config or an error if the LLM is unavailable/fails.
 func Run(ctx context.Context, provider *Provider, projectDir string, projectName string) (*Config, error) {
+	// Debug: Show which provider and model is being used
+	if os.Getenv("CHIMERA_DEBUG") == "1" {
+		println("[DEBUG] Agent using provider:", provider.Name)
+		println("[DEBUG] Agent using model:", provider.Model)
+	}
+	
 	// Step 0: Run regex-based scanner for heuristic data
 	tui.PrintInfo("Agent: Running heuristic scanner...")
 	repoScanner := scanner.NewScanner(projectDir)
@@ -147,6 +153,27 @@ func formatScanResults(result *scanner.ScanResult) string {
 		b.WriteString(fmt.Sprintf("  - %s %s (files: %s)\n", lang.Name, lang.Version, strings.Join(lang.Files, ", ")))
 	}
 
+	// Frameworks
+	b.WriteString("\nFRAMEWORKS DETECTED:\n")
+	if len(result.Frameworks) == 0 {
+		b.WriteString("  (none detected)\n")
+	}
+	for _, fw := range result.Frameworks {
+		b.WriteString(fmt.Sprintf("  - %s (Category: %s)\n", fw.Name, fw.Category))
+		if fw.EntryFile != "" {
+			b.WriteString(fmt.Sprintf("    Entry File: %s\n", fw.EntryFile))
+		}
+		if fw.StartCmd != "" {
+			b.WriteString(fmt.Sprintf("    Start Command: %s\n", fw.StartCmd))
+		}
+		if fw.BuildCmd != "" {
+			b.WriteString(fmt.Sprintf("    Build Command: %s\n", fw.BuildCmd))
+		}
+		if fw.InstallCmd != "" {
+			b.WriteString(fmt.Sprintf("    Install Command: %s\n", fw.InstallCmd))
+		}
+	}
+
 	// Infrastructure
 	b.WriteString("\nINFRASTRUCTURE DEPENDENCIES:\n")
 	if len(result.Infrastructure) == 0 {
@@ -187,6 +214,12 @@ func NewProvider() (*Provider, error) {
 	name := os.Getenv("CHIMERA_LLM_PROVIDER")
 	if name == "" {
 		name = "openai"
+	}
+
+	if os.Getenv("CHIMERA_DEBUG") == "1" {
+		println("[DEBUG] NewProvider called")
+		println("[DEBUG] CHIMERA_LLM_PROVIDER =", name)
+		println("[DEBUG] CHIMERA_MODEL =", os.Getenv("CHIMERA_MODEL"))
 	}
 
 	switch strings.ToLower(name) {

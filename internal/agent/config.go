@@ -8,25 +8,78 @@ import (
 )
 
 // LoadConfig loads environment variables from .chimera.env files.
-// Priority: local (./.chimera.env) > global (~/.chimera.env) > existing env vars.
+// Priority: existing env vars (highest) > local (./.chimera.env or .env) > global (~/.chimera.env)
 // Existing env vars are NOT overwritten — file values are only used as defaults.
 func LoadConfig() {
 	home, _ := os.UserHomeDir()
 
-	// Load global first (lower priority)
+	// Collect values from both files
+	globalVars := make(map[string]string)
+	localVars := make(map[string]string)
+
+	// Load global first
+	globalPath := ""
 	if home != "" {
-		loadEnvFile(filepath.Join(home, ".chimera.env"))
+		globalPath = filepath.Join(home, ".chimera.env")
+		globalVars = readEnvFile(globalPath)
 	}
 
-	// Load local (higher priority — overwrites global file values)
-	loadEnvFile(".chimera.env")
+	// Load local (overwrites global)
+	// Try .chimera.env first, then fall back to .env
+	localPath := ".chimera.env"
+	localVars = readEnvFile(localPath)
+	if len(localVars) == 0 {
+		localPath = ".env"
+		localVars = readEnvFile(localPath)
+	}
+
+	// Merge: local overwrites global
+	merged := make(map[string]string)
+	for k, v := range globalVars {
+		merged[k] = v
+	}
+	for k, v := range localVars {
+		merged[k] = v
+	}
+
+	// Set environment variables (only if not already set)
+	for key, value := range merged {
+		if os.Getenv(key) == "" && value != "" {
+			os.Setenv(key, value)
+		}
+	}
+	
+	// Debug output if CHIMERA_DEBUG is set
+	if os.Getenv("CHIMERA_DEBUG") == "1" {
+		if len(globalVars) > 0 {
+			println("[DEBUG] Loaded", len(globalVars), "vars from", globalPath)
+		}
+		if len(localVars) > 0 {
+			println("[DEBUG] Loaded", len(localVars), "vars from", localPath)
+		}
+		if len(merged) > 0 {
+			println("[DEBUG] Config loaded:")
+			for k := range merged {
+				// Don't print API keys
+				if strings.Contains(strings.ToLower(k), "key") || strings.Contains(strings.ToLower(k), "token") {
+					println("[DEBUG]  ", k, "= ***")
+				} else {
+					println("[DEBUG]  ", k, "=", merged[k])
+				}
+			}
+		} else {
+			println("[DEBUG] No config files found")
+		}
+	}
 }
 
-// loadEnvFile reads a .env-style file and sets env vars that are not already set.
-func loadEnvFile(path string) {
+// readEnvFile reads a .env-style file and returns key-value pairs
+func readEnvFile(path string) map[string]string {
+	vars := make(map[string]string)
+	
 	f, err := os.Open(path)
 	if err != nil {
-		return // file doesn't exist, that's fine
+		return vars // file doesn't exist, return empty map
 	}
 	defer f.Close()
 
@@ -51,7 +104,19 @@ func loadEnvFile(path string) {
 		// Remove surrounding quotes
 		value = strings.Trim(value, `"'`)
 
-		// Only set if not already in environment (env vars take precedence)
+		if key != "" && value != "" {
+			vars[key] = value
+		}
+	}
+	
+	return vars
+}
+
+// loadEnvFile reads a .env-style file and sets env vars that are not already set.
+// Deprecated: Use LoadConfig() instead which properly handles priority.
+func loadEnvFile(path string) {
+	vars := readEnvFile(path)
+	for key, value := range vars {
 		if os.Getenv(key) == "" && value != "" {
 			os.Setenv(key, value)
 		}

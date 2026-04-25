@@ -85,15 +85,26 @@ func runInit(cmd *cobra.Command, args []string) error {
 	projectName := proxy.ProjectName(repoURL)
 
 	// Phase 1: Determine workspace directory
+	tui.PrintBanner()
+	tui.PrintPhase(1, 10, "Workspace Initialization")
 	workspaceDir, err := determineWorkspaceDir(repoURL, initCwd)
 	if err != nil {
 		tui.PrintError(fmt.Sprintf("Failed to determine workspace: %v", err))
 		return err
 	}
 
-	if _, err := os.Stat(workspaceDir); err == nil && !initForce {
-		tui.PrintError(fmt.Sprintf("Workspace already exists at %s. Use --force to re-initialize.", workspaceDir))
-		return fmt.Errorf("workspace already exists")
+	// Check if workspace exists
+	if _, err := os.Stat(workspaceDir); err == nil {
+		if !initForce {
+			tui.PrintError(fmt.Sprintf("Workspace already exists at %s. Use --force to re-initialize.", workspaceDir))
+			return fmt.Errorf("workspace already exists")
+		}
+		// Force mode: remove existing workspace
+		tui.PrintWarning(fmt.Sprintf("Removing existing workspace: %s", workspaceDir))
+		if err := os.RemoveAll(workspaceDir); err != nil {
+			tui.PrintError(fmt.Sprintf("Failed to remove existing workspace: %v", err))
+			return fmt.Errorf("init: failed to remove existing workspace: %w", err)
+		}
 	}
 
 	if err := os.MkdirAll(workspaceDir, 0755); err != nil {
@@ -101,7 +112,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Phase 2: Clone
-	tui.PrintInfo("Cloning repository...")
+	tui.PrintPhase(2, 10, "Source Cloning")
+	tui.PrintInfo("Cloning repository from GitHub...")
 	gitClient := git.NewClient()
 	cloneOpts := &git.CloneOptions{
 		URL:       repoURL,
@@ -132,9 +144,39 @@ func runInit(cmd *cobra.Command, args []string) error {
 		tui.PrintWarning("  → Outputs are not guaranteed to be consistent")
 		tui.PrintWarning("  → Quick start guide will not be generated")
 		fmt.Println()
+	} else if agentMode {
+		// Check if required env vars are present
+		provider := os.Getenv("CHIMERA_LLM_PROVIDER")
+		if provider == "" {
+			provider = "openai"
+		}
+		
+		var apiKeyPresent bool
+		switch strings.ToLower(provider) {
+		case "openai":
+			apiKeyPresent = os.Getenv("OPENAI_API_KEY") != ""
+		case "gemini":
+			apiKeyPresent = os.Getenv("GEMINI_API_KEY") != ""
+		case "groq":
+			apiKeyPresent = os.Getenv("GROQ_API_KEY") != ""
+		}
+		
+		if !apiKeyPresent {
+			tui.PrintWarning("⚠ AI agent mode requires API key configuration")
+			tui.PrintWarning(fmt.Sprintf("  → Provider: %s", provider))
+			tui.PrintWarning("  → API key not found in environment")
+			fmt.Println()
+			tui.PrintInfo("💡 Run 'chimera setup' to configure AI agent")
+			tui.PrintInfo("   Or set the required environment variables manually")
+			fmt.Println()
+			tui.PrintWarning("→ Falling back to template-based generation for compatibility")
+			fmt.Println()
+			agentMode = false
+		}
 	}
 
 	// Phase 3: Scan (required for template mode, best effort for agent mode)
+	tui.PrintPhase(3, 10, "Heuristic Analysis")
 	tui.PrintInfo("Scanning codebase...")
 	repoScanner := scanner.NewScanner(workspaceDir)
 	var scanErr error
@@ -151,6 +193,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	if agentMode {
+		tui.PrintPhase(4, 10, "Agentic Config Generation")
 		// Try agent-based generation
 		prov, provErr := agent.NewProvider()
 		if provErr == nil {
@@ -187,7 +230,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 
 		// Phase 4: Generate compose manifest from templates
-		tui.PrintInfo("Generating environment...")
+		tui.PrintPhase(4, 10, "Template Config Generation")
+		tui.PrintInfo("Generating environment via templates...")
 		var genErr error
 		manifest, genErr = compose.Generate(projectName, scanResult)
 		if genErr != nil {
@@ -217,6 +261,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 
 	// Phase 5: Resolve port conflicts
+	tui.PrintPhase(5, 10, "Port Conflict Resolution")
 	tui.PrintInfo("Checking for port conflicts...")
 	desired := map[string]int{"app": appHostPort}
 	if scanResult != nil {
@@ -248,12 +293,14 @@ func runInit(cmd *cobra.Command, args []string) error {
 	tui.PrintSuccess("Ports resolved")
 
 	// Phase 6: Write files
+	tui.PrintPhase(6, 10, "Configuration Writing")
 	if err := writeManifest(workspaceDir, projectName, manifest, quickStartGuide); err != nil {
 		return fmt.Errorf("init: failed to write files: %w", err)
 	}
 	tui.PrintSuccess("Files written to workspace")
 
 	// Phase 7: Add /etc/hosts entry (only if --create-proxy)
+	tui.PrintPhase(7, 10, "Local Domain Setup")
 	if proxyEnabled {
 		domain := proxy.DeriveLocalDomain(repoURL)
 		// Write Caddyfile
@@ -267,9 +314,12 @@ func runInit(cmd *cobra.Command, args []string) error {
 		} else {
 			tui.PrintSuccess(fmt.Sprintf("Local domain: %s", domain))
 		}
+	} else {
+		tui.PrintInfo("Skipped (use --create-proxy to enable)")
 	}
 
 	// Phase 8: Start containers via docker compose (only if --docker-run)
+	tui.PrintPhase(8, 10, "Container Orchestration")
 	if initDockerRun {
 		tui.PrintInfo("Starting environment...")
 		if err := dockerComposeUp(ctx, workspaceDir, projectName); err != nil {
@@ -279,6 +329,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		tui.PrintSuccess("All containers started")
 
 		// Phase 9: Watch for failures (background AI healer) - only if docker is running
+		tui.PrintPhase(9, 10, "AI Healer Initialization")
 		go func() {
 			dockerCli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 			if err != nil {
@@ -309,14 +360,19 @@ func runInit(cmd *cobra.Command, args []string) error {
 				healer.RenderDiagnosis(diagnosis, containerID, os.Stderr)
 			})
 		}()
+		tui.PrintSuccess("Healer attached to containers")
+	} else {
+		tui.PrintPhase(9, 10, "AI Healer Initialization")
+		tui.PrintInfo("Skipped (Docker not running)")
 	}
 
 	// Phase 10: Print ready summary
+	tui.PrintPhase(10, 10, "Workspace Ready")
 	fmt.Println()
 	printReadySummary(projectName, manifest, workspaceDir, proxyEnabled, initDockerRun, proxyHostPort, appHostPort)
 
 	if initDockerRun && !GetQuiet(cmd) {
-		tui.PrintInfo("Press Ctrl+C to stop watching...")
+		tui.PrintHint("Press Ctrl+C to stop watching...")
 		<-ctx.Done()
 	}
 

@@ -178,7 +178,7 @@ func Generate(projectName string, result *scanner.ScanResult) (*ComposeManifest,
 	manifest.DockerCompose = b.String()
 
 	// Generate Dockerfile
-	manifest.Dockerfile = GenerateDockerfile(result.Languages[0])
+	manifest.Dockerfile = GenerateDockerfile(result)
 
 	// Generate .env.example
 	manifest.EnvExample = GenerateEnvFile(projectName, result)
