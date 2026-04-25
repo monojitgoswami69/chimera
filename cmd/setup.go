@@ -50,11 +50,12 @@ func init() {
 func runSetup(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 	
-	tui.PrintHeader("Chimera Setup Wizard")
+	tui.PrintBanner()
+	tui.PrintHeader("Chimera AI Configuration Wizard")
 	fmt.Println()
 	
-	fmt.Println("This wizard will help you configure Chimera's AI agent for smarter")
-	fmt.Println("code analysis and environment generation.")
+	tui.PrintInfo("This wizard will help you configure Chimera's AI agent for smarter")
+	tui.PrintInfo("code analysis and autonomous environment generation.")
 	fmt.Println()
 	
 	// Step 1: Select provider
@@ -118,29 +119,28 @@ func runSetup(cmd *cobra.Command, args []string) error {
 
 // selectProvider prompts user to select an LLM provider
 func selectProvider() string {
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	fmt.Println("  STEP 1: Select LLM Provider")
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	tui.PrintSubheader("STEP 1: Select LLM Provider")
+	tui.PrintDivider()
 	fmt.Println()
-	fmt.Println("Available providers:")
+	fmt.Println(tui.BoldStyle.Render("  Available providers:"))
 	fmt.Println()
-	fmt.Println("  1. OpenAI")
-	fmt.Println("     • Models: GPT-4o, GPT-4o-mini, GPT-4-turbo")
-	fmt.Println("     • Best for: General purpose, high quality")
-	fmt.Println("     • Get API key: https://platform.openai.com/api-keys")
-	fmt.Println("     • Recommended: ⭐ GPT-4o-mini (fast, cost-effective)")
+	fmt.Println(tui.InfoStyle.Render("  1. OpenAI"))
+	tui.PrintListItem("Models: GPT-4o, GPT-4o-mini, GPT-4-turbo")
+	tui.PrintListItem("Best for: General purpose, high quality")
+	tui.PrintListItem("Get API key: https://platform.openai.com/api-keys")
+	tui.PrintListItem("Recommended: ⭐ GPT-4o-mini (fast, cost-effective)")
 	fmt.Println()
-	fmt.Println("  2. Google Gemini")
-	fmt.Println("     • Models: Gemini 2.0 Flash, Gemini 1.5 Pro")
-	fmt.Println("     • Best for: Fast responses, large context")
-	fmt.Println("     • Get API key: https://aistudio.google.com/apikey")
-	fmt.Println("     • Recommended: ⭐ Gemini 2.0 Flash (fastest)")
+	fmt.Println(tui.InfoStyle.Render("  2. Google Gemini"))
+	tui.PrintListItem("Models: Gemini 2.0 Flash, Gemini 1.5 Pro")
+	tui.PrintListItem("Best for: Fast responses, large context")
+	tui.PrintListItem("Get API key: https://aistudio.google.com/apikey")
+	tui.PrintListItem("Recommended: ⭐ Gemini 2.0 Flash (fastest)")
 	fmt.Println()
-	fmt.Println("  3. Groq")
-	fmt.Println("     • Models: Llama 3.1 70B, Mixtral 8x7B")
-	fmt.Println("     • Best for: Ultra-fast inference, open models")
-	fmt.Println("     • Get API key: https://console.groq.com/keys")
-	fmt.Println("     • Recommended: ⭐ Llama 3.1 70B (powerful, fast)")
+	fmt.Println(tui.InfoStyle.Render("  3. Groq"))
+	tui.PrintListItem("Models: Llama 3.1 70B, Mixtral 8x7B")
+	tui.PrintListItem("Best for: Ultra-fast inference, open models")
+	tui.PrintListItem("Get API key: https://console.groq.com/keys")
+	tui.PrintListItem("Recommended: ⭐ Llama 3.1 70B (powerful, fast)")
 	fmt.Println()
 	
 	reader := bufio.NewReader(os.Stdin)
@@ -167,9 +167,8 @@ func selectProvider() string {
 
 // enterAPIKey prompts user to enter their API key
 func enterAPIKey(provider string) string {
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	fmt.Println("  STEP 2: Enter API Key")
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	tui.PrintSubheader("STEP 2: Enter API Key")
+	tui.PrintDivider()
 	fmt.Println()
 	
 	var keyURL string
@@ -515,11 +514,10 @@ func sortModelsByPriority(models []ModelInfo, priority map[string]int) {
 
 // selectModel prompts user to select a model
 func selectModel(provider string, models []ModelInfo) string {
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-	fmt.Println("  STEP 3: Select Model")
-	fmt.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+	tui.PrintSubheader("STEP 3: Select Model")
+	tui.PrintDivider()
 	fmt.Println()
-	fmt.Println("Available models:")
+	fmt.Println(tui.BoldStyle.Render("  Available models:"))
 	fmt.Println()
 	
 	for i, model := range models {

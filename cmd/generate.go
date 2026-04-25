@@ -55,7 +55,11 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	repoURL := args[0]
 	projectName := proxy.ProjectName(repoURL)
 
+	tui.PrintBannerCompact()
+	fmt.Println()
+
 	// Determine output directory
+	tui.PrintPhase(1, 4, "Output Initialization")
 	outputDir := generateOutput
 	if outputDir == "" {
 		outputDir = filepath.Join(os.TempDir(), fmt.Sprintf("chimera-generate-%s", projectName))
@@ -66,7 +70,8 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 	}
 
 	// Clone to temp dir
-	tui.PrintInfo("Cloning repository...")
+	tui.PrintPhase(2, 4, "Source Cloning")
+	tui.PrintInfo("Cloning repository from GitHub...")
 	tmpDir, err := os.MkdirTemp("", "chimera-clone-*")
 	if err != nil {
 		return fmt.Errorf("generate: failed to create temp dir: %w", err)
@@ -95,6 +100,7 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 
 // runAgentGenerate uses the multi-turn LLM pipeline for config generation.
 func runAgentGenerate(ctx context.Context, projectDir, projectName, outputDir string) error {
+	tui.PrintPhase(3, 4, "Agentic Config Generation")
 	provider, err := agent.NewProvider()
 	if err != nil {
 		tui.PrintWarning(fmt.Sprintf("Agent unavailable: %v", err))
@@ -109,6 +115,7 @@ func runAgentGenerate(ctx context.Context, projectDir, projectName, outputDir st
 		return runTemplateGenerate(ctx, projectDir, projectName, outputDir)
 	}
 
+	tui.PrintPhase(4, 4, "Configuration Writing")
 	// Write agent-generated files
 	files := map[string]string{
 		"docker-compose.yml": config.DockerCompose,
@@ -132,6 +139,7 @@ func runAgentGenerate(ctx context.Context, projectDir, projectName, outputDir st
 // runTemplateGenerate uses the scanner + template pipeline.
 func runTemplateGenerate(ctx context.Context, projectDir, projectName, outputDir string) error {
 	// Scan
+	tui.PrintPhase(3, 4, "Heuristic Analysis")
 	tui.PrintInfo("Scanning codebase...")
 	repoScanner := scanner.NewScanner(projectDir)
 	scanResult, err := repoScanner.Scan(ctx)
@@ -141,6 +149,7 @@ func runTemplateGenerate(ctx context.Context, projectDir, projectName, outputDir
 	tui.PrintSuccess(fmt.Sprintf("Detected: %s", formatLanguages(scanResult)))
 
 	// Generate
+	tui.PrintPhase(4, 4, "Template Config Generation")
 	tui.PrintInfo("Generating environment files...")
 	manifest, err := compose.Generate(projectName, scanResult)
 	if err != nil {

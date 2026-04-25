@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/projectchimera/chimera/internal/agent"
+	"github.com/projectchimera/chimera/internal/tui"
 	"github.com/spf13/cobra"
 )
 
@@ -44,6 +45,16 @@ func init() {
 
 	// Set custom version template
 	rootCmd.SetVersionTemplate(fmt.Sprintf("Chimera %s (built %s)\n", Version, BuildTime))
+
+	// Set custom help function to inject ASCII banner
+	defaultHelpFunc := rootCmd.HelpFunc()
+	rootCmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		// Only print banner for the root command help
+		if cmd.Name() == "chimera" {
+			tui.PrintBanner()
+		}
+		defaultHelpFunc(cmd, args)
+	})
 }
 
 // GetVerbose returns whether verbose mode is enabled
