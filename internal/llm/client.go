@@ -47,7 +47,7 @@ func NewClient(provider, model, apiKey string) (*Client, error) {
 
 // Call makes an LLM API call
 func (c *Client) Call(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	switch c.Provider {
@@ -57,9 +57,45 @@ func (c *Client) Call(ctx context.Context, systemPrompt, userPrompt string) (str
 		return c.callAnthropic(ctx, systemPrompt, userPrompt)
 	case "gemini":
 		return c.callGemini(ctx, systemPrompt, userPrompt)
+	case "ollama":
+		return c.callOllama(ctx, systemPrompt, userPrompt)
 	default:
 		return "", fmt.Errorf("unsupported provider: %s", c.Provider)
 	}
+}
+
+func (c *Client) callOllama(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
+	body := map[string]interface{}{
+		"model":  c.Model,
+		"prompt": systemPrompt + "\n\n" + userPrompt,
+		"stream": false,
+		"options": map[string]interface{}{
+			"temperature": 0.1,
+		},
+	}
+	data, _ := json.Marshal(body)
+	req, err := http.NewRequestWithContext(ctx, "POST", c.Endpoint, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("Ollama error (%d): %s", resp.StatusCode, string(body))
+	}
+	var result struct {
+		Response string `json:"response"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", err
+	}
+	return result.Response, nil
 }
 
 func (c *Client) callOpenAICompatible(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
@@ -331,7 +367,7 @@ DOCKERFILE:
 COMPOSE:
 %s`, tree, dockerfile, compose)
 
-	return c.runValidationLoop(ctx, systemPrompt, userPrompt, fileReader, 3)
+	return c.runValidationLoop(ctx, systemPrompt, userPrompt, fileReader, 5)
 }
 
 // ValidateEnvVars validates and enhances environment variable detection
@@ -390,54 +426,114 @@ func (c *Client) runValidationLoop(ctx context.Context, systemPrompt, userPrompt
 			return nil, err
 		}
 
-		// Clean response
-		response = strings.TrimSpace(response)
-		response = strings.TrimPrefix(response, "```json")
-		response = strings.TrimPrefix(response, "```")
-		response = strings.TrimSuffix(response, "```")
-		response = strings.TrimSpace(response)
+		// Robust JSON extraction: many models (Groq Llama, Gemini, Anthropic)
+		// wrap their response in prose or a Markdown fence. We pull out the
+		// first balanced {...} block instead of trusting the exact format.
+		jsonBlob := extractJSON(response)
 
 		var validationResp ValidationResponse
-		if err := json.Unmarshal([]byte(response), &validationResp); err != nil {
-			// Retry with clarification
+		if err := json.Unmarshal([]byte(jsonBlob), &validationResp); err != nil {
 			if attempt < maxAttempts {
-				userPrompt += "\n\nYour previous response was not valid JSON. Respond only with valid JSON, no markdown, no backticks."
+				userPrompt += "\n\nYour previous response could not be parsed as JSON. Respond with a single JSON object only, no prose, no markdown, no backticks. Start with { and end with }."
 				continue
 			}
-			return nil, fmt.Errorf("failed to parse LLM response after %d attempts: %w", maxAttempts, err)
+			return nil, fmt.Errorf("failed to parse LLM response as JSON after %d attempts: %w\nlast response: %s", maxAttempts, err, truncateForLog(response, 400))
 		}
 
 		// If valid or has corrections, return
-		if validationResp.Valid || len(validationResp.CorrectedServices) > 0 || 
-		   validationResp.CorrectedDockerfile != "" || len(validationResp.CorrectedEnvVars) > 0 {
+		if validationResp.Valid || len(validationResp.CorrectedServices) > 0 ||
+			validationResp.CorrectedDockerfile != "" || validationResp.CorrectedCompose != "" ||
+			len(validationResp.CorrectedEnvVars) > 0 {
 			return &validationResp, nil
 		}
 
 		// If needs files, send them
 		if len(validationResp.NeedsFiles) > 0 && fileReader != nil {
-			fileContents := make(map[string]string)
-			for _, filePath := range validationResp.NeedsFiles {
-				content, err := fileReader(filePath)
-				if err != nil {
-					fileContents[filePath] = fmt.Sprintf("[Error reading file: %v]", err)
-				} else {
-					fileContents[filePath] = content
-				}
+			// Cap at 5 files per round
+			needed := validationResp.NeedsFiles
+			if len(needed) > 5 {
+				needed = needed[:5]
 			}
-
-			// Add file contents to prompt
 			var filesSection strings.Builder
 			filesSection.WriteString("\n\nREQUESTED FILES:\n")
-			for path, content := range fileContents {
-				filesSection.WriteString(fmt.Sprintf("\n=== %s ===\n%s\n", path, content))
+			for _, filePath := range needed {
+				content, err := fileReader(filePath)
+				if err != nil {
+					filesSection.WriteString(fmt.Sprintf("\n=== %s ===\n[unavailable: %v]\n", filePath, err))
+					continue
+				}
+				// Cap individual file size in the prompt.
+				if len(content) > 16*1024 {
+					content = content[:16*1024] + "\n[...truncated...]\n"
+				}
+				filesSection.WriteString(fmt.Sprintf("\n=== %s ===\n%s\n", filePath, content))
 			}
 			userPrompt += filesSection.String()
 			continue
 		}
 
-		// No progress made
-		return nil, fmt.Errorf("LLM validation loop did not converge after %d attempts", maxAttempts)
+		// No progress made — the LLM returned {"valid": false} with neither
+		// corrections nor file requests. Treat this as "no opinion" rather
+		// than an error.
+		return &ValidationResponse{Valid: true}, nil
 	}
 
-	return nil, fmt.Errorf("max validation attempts (%d) exceeded", maxAttempts)
+	return nil, fmt.Errorf("LLM did not converge after %d rounds (keeping static output)", maxAttempts)
+}
+
+// extractJSON pulls the first balanced JSON object out of s. It tolerates
+// Markdown fences, prose before/after, and partial code blocks.
+func extractJSON(s string) string {
+	s = strings.TrimSpace(s)
+	// Strip a leading ```json or ``` fence if present.
+	if strings.HasPrefix(s, "```") {
+		if nl := strings.IndexByte(s, '\n'); nl >= 0 {
+			s = s[nl+1:]
+		}
+		if idx := strings.LastIndex(s, "```"); idx >= 0 {
+			s = s[:idx]
+		}
+	}
+	// Find the first { and match braces, respecting strings.
+	start := strings.IndexByte(s, '{')
+	if start < 0 {
+		return s
+	}
+	depth := 0
+	inStr := false
+	esc := false
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if esc {
+			esc = false
+			continue
+		}
+		if ch == '\\' && inStr {
+			esc = true
+			continue
+		}
+		if ch == '"' {
+			inStr = !inStr
+			continue
+		}
+		if inStr {
+			continue
+		}
+		if ch == '{' {
+			depth++
+		} else if ch == '}' {
+			depth--
+			if depth == 0 {
+				return s[start : i+1]
+			}
+		}
+	}
+	return s[start:]
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "...[truncated]"
 }

@@ -7,11 +7,13 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
 	"chimera/internal/config"
 	"chimera/internal/llm"
+	"chimera/internal/termio"
 	"chimera/internal/ui"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -23,7 +25,7 @@ var setupCmd = &cobra.Command{
 	Short: "Configure your LLM provider and API key",
 	Long: `Interactive wizard to configure Chimera with your LLM provider, API key, and optional GitHub PAT.
 
-This creates ~/.chimera/.chimera.env with your configuration.
+This creates ~/.chimera/config.json with your configuration (chmod 0600).
 
 Flags:
   --force    Force reconfiguration even if config already exists
@@ -32,235 +34,171 @@ Examples:
   chimera setup
   chimera setup --force`,
 	Run: func(cmd *cobra.Command, args []string) {
-		runSetup()
+		if err := runSetup(); err != nil {
+			fmt.Println(ui.ErrorLine(err.Error()))
+			os.Exit(1)
+		}
 	},
 }
 
-var (
-	setupForce bool
-)
+var setupForce bool
 
 func init() {
 	setupCmd.Flags().BoolVar(&setupForce, "force", false, "Force reconfiguration even if config exists")
 }
 
-
-
-func runSetup() {
-	// Check if config already exists
-	if !setupForce {
+func runSetup() error {
+	if !setupForce && config.Exists() {
 		configPath, _ := config.ConfigPath()
-		if _, err := os.Stat(configPath); err == nil {
-			// Config exists
-			fmt.Println(ui.Header("setup"))
-			fmt.Println(ui.WarningLine("Configuration already exists"))
-			fmt.Println()
-			fmt.Println(ui.InfoLine(fmt.Sprintf("Config file: %s", configPath)))
-			fmt.Println()
-			fmt.Println(ui.DimStyle.Render("To reconfigure, run:"))
-			fmt.Println(ui.HighlightStyle.Render("  chimera setup --force"))
-			fmt.Println()
-			return
-		}
+		fmt.Println(ui.Header(ui.HeaderArgs{Command: "setup", Version: Version}))
+		fmt.Println(ui.WarningLine("Configuration already exists"))
+		fmt.Println(ui.InfoLine(fmt.Sprintf("Config file: %s", configPath)))
+		fmt.Println()
+		fmt.Println(ui.DimStyle.Render("To reconfigure, run:"))
+		fmt.Println(ui.HighlightStyle.Render("  chimera setup --force"))
+		return nil
 	}
 
-	// Print banner once
-	fmt.Print(ui.Header("setup"))
+	fmt.Print(ui.Header(ui.HeaderArgs{Command: "setup", Version: Version}))
 
-	// Step 1: Provider selection
-	fmt.Println(ui.BoldStyle.Render("Select LLM Provider:"))
-	fmt.Println()
-	
-	providers := []string{"OpenAI", "Anthropic (Claude)", "Groq", "Google Gemini", "Ollama (local)"}
+	// Step 1: provider
+	fmt.Println(ui.Step(1, 5, "Choose an LLM provider"))
+	providers := []string{"OpenAI", "Anthropic (Claude)", "Groq", "Google Gemini", "Ollama (local, no API key)"}
 	providerKeys := []string{"openai", "anthropic", "groq", "gemini", "ollama"}
-	
-	selectedProvider := selectFromList(providers)
-	if selectedProvider == -1 {
-		fmt.Println(ui.ErrorLine("Setup cancelled"))
-		return
+	idx := selectFromList(providers)
+	if idx == -1 {
+		return fmt.Errorf("setup cancelled")
 	}
-	provider := providerKeys[selectedProvider]
-	
-	fmt.Println(ui.SuccessLine(fmt.Sprintf("Selected: %s", providers[selectedProvider])))
-	fmt.Println()
+	provider := providerKeys[idx]
+	fmt.Println(ui.SuccessLine("Selected " + providers[idx]))
 
-	// Step 2: API key entry
-	fmt.Println(ui.BoldStyle.Render(fmt.Sprintf("Enter your %s API key:", strings.Title(provider))))
-	fmt.Print("  ")
-	apiKey := readMaskedInput()
-	if apiKey == "" {
-		fmt.Println(ui.ErrorLine("API key cannot be empty"))
-		return
+	// Step 2: API key (skipped for Ollama)
+	var apiKey string
+	if provider != "ollama" {
+		fmt.Println(ui.Step(2, 5, fmt.Sprintf("Paste your %s API key", titleCase(provider))))
+		fmt.Println(ui.DimStyle.Render("  (input is hidden)"))
+		fmt.Print("  ")
+		key, err := termio.ReadSecret()
+		if err != nil {
+			return fmt.Errorf("failed to read API key: %w", err)
+		}
+		if strings.TrimSpace(key) == "" {
+			return fmt.Errorf("API key cannot be empty")
+		}
+		apiKey = strings.TrimSpace(key)
+		fmt.Println(ui.SuccessLine("API key recorded"))
+	} else {
+		fmt.Println(ui.Step(2, 5, "Ollama detected — checking local daemon"))
 	}
-	fmt.Println(ui.SuccessLine("API key entered"))
-	fmt.Println()
 
-	// Step 3: Fetch models
-	fmt.Println(ui.SpinnerLine("⠹", fmt.Sprintf("Fetching available models from %s...", strings.Title(provider))))
-	
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Step 3: model
+	fmt.Println(ui.Step(3, 5, "Pick a model"))
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	
 	models, err := fetchModelsFromProvider(ctx, provider, apiKey)
 	var model string
-	
-	if err != nil {
-		fmt.Println(ui.WarningLine(fmt.Sprintf("Failed to fetch models: %v", err)))
-		fmt.Println()
-		fmt.Println(ui.BoldStyle.Render("Enter model name manually:"))
-		fmt.Print("  ")
-		model = readInput()
-		if model == "" {
-			fmt.Println(ui.ErrorLine("Model name cannot be empty"))
-			return
+	if err != nil || len(models) == 0 {
+		if err != nil {
+			fmt.Println(ui.WarningLine(fmt.Sprintf("Could not list models automatically (%v) — enter a name manually.", err)))
+		} else {
+			fmt.Println(ui.WarningLine("No models returned — enter a name manually."))
+		}
+		fmt.Print("  Model name: ")
+		model = termio.ReadLine()
+		if strings.TrimSpace(model) == "" {
+			return fmt.Errorf("model name cannot be empty")
 		}
 	} else {
-		fmt.Println(ui.SuccessLine(fmt.Sprintf("Fetched %d models", len(models))))
-		fmt.Println()
-		
-		// Step 4: Model selection
-		fmt.Println(ui.BoldStyle.Render("Select Model:"))
-		fmt.Println()
-		
-		// Mark recommended models
-		displayModels := make([]string, len(models))
+		display := make([]string, len(models))
 		for i, m := range models {
 			if isRecommendedModel(provider, m) {
-				displayModels[i] = "★ " + m
+				display[i] = "★ " + m
 			} else {
-				displayModels[i] = m
+				display[i] = m
 			}
 		}
-		
-		selectedModel := selectFromList(displayModels)
-		if selectedModel == -1 {
-			fmt.Println(ui.ErrorLine("Setup cancelled"))
-			return
+		mIdx := selectFromList(display)
+		if mIdx == -1 {
+			return fmt.Errorf("setup cancelled")
 		}
-		model = models[selectedModel]
-		
-		fmt.Println(ui.SuccessLine(fmt.Sprintf("Selected: %s", model)))
-		fmt.Println()
+		model = models[mIdx]
+	}
+	fmt.Println(ui.SuccessLine("Selected " + model))
+
+	// Step 4: verify
+	fmt.Println(ui.Step(4, 5, "Verify connection?"))
+	verifyIdx := selectFromList([]string{"Yes (recommended)", "Skip"})
+	if verifyIdx == -1 {
+		return fmt.Errorf("setup cancelled")
+	}
+	if verifyIdx == 0 {
+		client, cerr := llm.NewClient(provider, model, apiKey)
+		if cerr != nil {
+			return fmt.Errorf("could not create LLM client: %w", cerr)
+		}
+		vctx, vcancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer vcancel()
+		_, perr := client.Call(vctx, "You are a helpful assistant. Reply with only the word pong.", "ping")
+		if perr != nil {
+			return fmt.Errorf("verification failed: %w", perr)
+		}
+		fmt.Println(ui.SuccessLine("Connection verified"))
+	} else {
+		fmt.Println(ui.WarningLine("Skipped verification"))
 	}
 
-	// Step 5: Verify connection prompt
-	fmt.Println(ui.BoldStyle.Render("Verify connection with a test message?"))
-	fmt.Println()
-	
-	verifyChoice := selectFromList([]string{"Yes", "No"})
-	if verifyChoice == -1 {
-		fmt.Println(ui.ErrorLine("Setup cancelled"))
-		return
+	// Step 5: PAT
+	fmt.Println(ui.Step(5, 5, "Add a GitHub PAT for private repos? (optional)"))
+	patIdx := selectFromList([]string{"No", "Yes"})
+	if patIdx == -1 {
+		return fmt.Errorf("setup cancelled")
 	}
-	
-	fmt.Println(ui.SuccessLine([]string{"Yes", "No"}[verifyChoice]))
-	fmt.Println()
-
-	if verifyChoice == 0 {
-		// Step 6: Verify connection
-		fmt.Println(ui.SpinnerLine("⠸", fmt.Sprintf("Sending ping to %s/%s...", strings.Title(provider), model)))
-		
-		llmClient, err := llm.NewClient(provider, model, apiKey)
+	var pat string
+	if patIdx == 1 {
+		fmt.Println(ui.DimStyle.Render("  Needs `repo` scope. Create one at https://github.com/settings/tokens"))
+		fmt.Print("  PAT: ")
+		key, err := termio.ReadSecret()
 		if err != nil {
-			fmt.Println(ui.ErrorLine(fmt.Sprintf("Failed to create client: %v", err)))
-			fmt.Println()
-			
-			retryChoice := selectFromList([]string{"Change model", "Re-enter API key", "Skip verification"})
-			if retryChoice == 0 {
-				fmt.Println(ui.InfoLine("Please restart setup to change model"))
-				return
-			} else if retryChoice == 1 {
-				fmt.Println(ui.InfoLine("Please restart setup to re-enter API key"))
-				return
-			}
-			// Skip verification
-		} else {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			
-			_, err = llmClient.Call(ctx, "You are a helpful assistant.", "ping")
-			if err != nil {
-				fmt.Println(ui.ErrorLine(fmt.Sprintf("Connection failed: %v", err)))
-				fmt.Println()
-				
-				retryChoice := selectFromList([]string{"Change model", "Re-enter API key", "Skip verification"})
-				if retryChoice == 0 || retryChoice == 1 {
-					fmt.Println(ui.InfoLine("Please restart setup"))
-					return
-				}
-				// Skip verification
-			} else {
-				fmt.Println(ui.SuccessLine("Connection verified"))
-				fmt.Println()
-			}
+			return fmt.Errorf("failed to read PAT: %w", err)
+		}
+		pat = strings.TrimSpace(key)
+		if pat != "" && !strings.HasPrefix(pat, "ghp_") && !strings.HasPrefix(pat, "github_pat_") {
+			fmt.Println(ui.WarningLine("PAT does not start with ghp_ or github_pat_ — saving anyway"))
 		}
 	}
 
-	// Step 7: GitHub PAT prompt
-	fmt.Println(ui.BoldStyle.Render("Add GitHub Personal Access Token for private repos?"))
-	fmt.Println()
-	
-	patChoice := selectFromList([]string{"Yes", "No"})
-	if patChoice == -1 {
-		fmt.Println(ui.ErrorLine("Setup cancelled"))
-		return
-	}
-	
-	fmt.Println(ui.SuccessLine([]string{"Yes", "No"}[patChoice]))
-	fmt.Println()
-
-	var githubPAT string
-	if patChoice == 0 {
-		fmt.Println(ui.DimStyle.Render("  Your PAT needs 'repo' scope. Generate one at:"))
-		fmt.Println("  " + ui.HighlightStyle.Render("https://github.com/settings/tokens"))
-		fmt.Println()
-		fmt.Println(ui.BoldStyle.Render("Enter GitHub PAT:"))
-		fmt.Print("  ")
-		githubPAT = readMaskedInput()
-		
-		if githubPAT != "" && !strings.HasPrefix(githubPAT, "ghp_") && !strings.HasPrefix(githubPAT, "github_pat_") {
-			fmt.Println(ui.WarningLine("Warning: PAT should start with ghp_ or github_pat_"))
-			fmt.Println()
-		} else if githubPAT != "" {
-			fmt.Println(ui.SuccessLine("GitHub PAT entered"))
-			fmt.Println()
-		}
-	}
-
-	// Step 8: Save configuration
-	fmt.Println(ui.SpinnerLine("⠹", "Saving configuration..."))
-	
 	cfg := &config.Config{
 		LLMProvider: provider,
 		LLMModel:    model,
 		LLMAPIKey:   apiKey,
-		GitHubPAT:   githubPAT,
+		GitHubPAT:   pat,
 	}
-
 	if err := config.Save(cfg); err != nil {
-		fmt.Println(ui.ErrorLine(fmt.Sprintf("Failed to save config: %v", err)))
-		return
+		return fmt.Errorf("could not save config: %w", err)
 	}
+	cfgPath, _ := config.ConfigPath()
 
-	configPath, _ := config.ConfigPath()
-	fmt.Println(ui.SuccessLine(fmt.Sprintf("Config written to %s", configPath)))
-	fmt.Println()
-
-	// Step 9: Completion
-	completionMsg := fmt.Sprintf(
-		"Chimera is ready.\n\n"+
-			"Provider: %s · Model: %s\n\n"+
-			"Run  chimera init <github-url>  to get started.",
-		ui.HighlightStyle.Render(strings.Title(provider)),
+	msg := fmt.Sprintf(
+		"Chimera is ready.\n\n  Provider · %s\n  Model    · %s\n  Config   · %s\n\nTry:\n  %s",
+		ui.HighlightStyle.Render(titleCase(provider)),
 		ui.HighlightStyle.Render(model),
+		ui.DimStyle.Render(cfgPath),
+		ui.HighlightStyle.Render("chimera init <github-url>"),
 	)
-
-	box := ui.SuccessBox.Render(completionMsg)
-	fmt.Println(box)
 	fmt.Println()
+	fmt.Println(ui.SuccessBox.Render(msg))
+	fmt.Println()
+	return nil
 }
 
-// selectorModel is a simple Bubble Tea model for interactive list selection
+func titleCase(s string) string {
+	if s == "" {
+		return s
+	}
+	return strings.ToUpper(s[:1]) + s[1:]
+}
+
+// selectorModel is a simple Bubble Tea model for interactive list selection.
 type selectorModel struct {
 	cursor int
 	items  []string
@@ -268,30 +206,23 @@ type selectorModel struct {
 	choice int
 }
 
-// selectFromList shows an interactive list and returns the selected index (-1 if cancelled)
 func selectFromList(items []string) int {
 	m := selectorModel{items: items, choice: -1}
-
 	p := tea.NewProgram(m)
 	result, err := p.Run()
 	if err != nil {
 		return -1
 	}
-
 	return result.(selectorModel).choice
 }
 
-// Init for the selector
-func (m selectorModel) Init() tea.Cmd {
-	return nil
-}
+func (m selectorModel) Init() tea.Cmd { return nil }
 
-// Update for the selector
 func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q":
+		case "ctrl+c", "q", "esc":
 			m.done = true
 			m.choice = -1
 			return m, tea.Quit
@@ -312,12 +243,10 @@ func (m selectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// View for the selector
 func (m selectorModel) View() string {
 	if m.done {
 		return ""
 	}
-
 	var b strings.Builder
 	for i, item := range m.items {
 		cursor := " "
@@ -334,22 +263,6 @@ func (m selectorModel) View() string {
 	return b.String()
 }
 
-// readInput reads a line of input
-func readInput() string {
-	var input string
-	fmt.Scanln(&input)
-	return strings.TrimSpace(input)
-}
-
-// readMaskedInput reads input without echoing (for passwords)
-func readMaskedInput() string {
-	// For simplicity, we'll use a basic approach
-	// In production, you'd want to use golang.org/x/term for proper masking
-	var input string
-	fmt.Scanln(&input)
-	return strings.TrimSpace(input)
-}
-
 func fetchModelsFromProvider(ctx context.Context, provider, apiKey string) ([]string, error) {
 	switch provider {
 	case "openai":
@@ -362,9 +275,8 @@ func fetchModelsFromProvider(ctx context.Context, provider, apiKey string) ([]st
 		return fetchGeminiModels(ctx, apiKey)
 	case "ollama":
 		return fetchOllamaModels(ctx)
-	default:
-		return nil, fmt.Errorf("unsupported provider: %s", provider)
 	}
+	return nil, fmt.Errorf("unsupported provider: %s", provider)
 }
 
 func fetchOpenAIModels(ctx context.Context, apiKey string) ([]string, error) {
@@ -372,73 +284,41 @@ func fetchOpenAIModels(ctx context.Context, apiKey string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
 	}
-
 	var result struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
-	// Filter to chat models only
-	var models []string
+	var chat []string
 	for _, m := range result.Data {
 		if strings.Contains(m.ID, "gpt") && !strings.Contains(m.ID, "instruct") {
-			models = append(models, m.ID)
+			chat = append(chat, m.ID)
 		}
 	}
-
-	// Sort with recommended first
-	sortedModels := []string{}
-	recommended := []string{"gpt-4o", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"}
-	for _, r := range recommended {
-		for _, m := range models {
-			if m == r {
-				sortedModels = append(sortedModels, m)
-			}
-		}
-	}
-
-	// Add remaining models
-	for _, m := range models {
-		found := false
-		for _, s := range sortedModels {
-			if s == m {
-				found = true
-				break
-			}
-		}
-		if !found {
-			sortedModels = append(sortedModels, m)
-		}
-	}
-
-	return sortedModels, nil
+	sort.Strings(chat)
+	preferred := []string{"gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo"}
+	return sortRecommendedFirst(chat, preferred), nil
 }
 
 func getAnthropicModels() []string {
-	// Anthropic doesn't expose a public models endpoint
 	return []string{
-		"claude-sonnet-4",
+		"claude-opus-4-7",
+		"claude-sonnet-4-6",
+		"claude-haiku-4-5",
 		"claude-3-5-sonnet-20241022",
-		"claude-3-opus-20240229",
-		"claude-3-sonnet-20240229",
 		"claude-3-haiku-20240307",
 	}
 }
@@ -448,35 +328,29 @@ func fetchGroqModels(ctx context.Context, apiKey string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	req.Header.Set("Authorization", "Bearer "+apiKey)
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
 	}
-
 	var result struct {
 		Data []struct {
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
 	var models []string
 	for _, m := range result.Data {
 		models = append(models, m.ID)
 	}
-
+	sort.Strings(models)
 	return models, nil
 }
 
@@ -486,41 +360,34 @@ func fetchGeminiModels(ctx context.Context, apiKey string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
 	}
-
 	var result struct {
 		Models []struct {
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
 	var models []string
 	for _, m := range result.Models {
-		// Extract model ID from name (e.g., "models/gemini-pro" -> "gemini-pro")
 		parts := strings.Split(m.Name, "/")
 		if len(parts) > 1 {
-			modelID := parts[len(parts)-1]
-			// Filter to generative models only
-			if strings.Contains(modelID, "gemini") && !strings.Contains(modelID, "embedding") {
-				models = append(models, modelID)
+			id := parts[len(parts)-1]
+			if strings.Contains(id, "gemini") && !strings.Contains(id, "embedding") {
+				models = append(models, id)
 			}
 		}
 	}
-
+	sort.Strings(models)
 	return models, nil
 }
 
@@ -529,45 +396,60 @@ func fetchOllamaModels(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("Ollama not running or not accessible at localhost:11434")
+		return nil, fmt.Errorf("ollama not running on localhost:11434")
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("Ollama API error (%d)", resp.StatusCode)
+		return nil, fmt.Errorf("ollama API error (%d)", resp.StatusCode)
 	}
-
 	var result struct {
 		Models []struct {
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return nil, err
 	}
-
-	var models []string
+	var names []string
 	for _, m := range result.Models {
-		models = append(models, m.Name)
+		names = append(names, m.Name)
 	}
+	sort.Strings(names)
+	return names, nil
+}
 
-	return models, nil
+func sortRecommendedFirst(models, preferred []string) []string {
+	pref := map[string]int{}
+	for i, p := range preferred {
+		pref[p] = i + 1
+	}
+	sort.SliceStable(models, func(i, j int) bool {
+		pi, oi := pref[models[i]], pref[models[j]]
+		if pi != 0 && oi != 0 {
+			return pi < oi
+		}
+		if pi != 0 {
+			return true
+		}
+		if oi != 0 {
+			return false
+		}
+		return models[i] < models[j]
+	})
+	return models
 }
 
 func isRecommendedModel(provider, model string) bool {
-	recommended := map[string][]string{
-		"openai":    {"gpt-4o", "gpt-4-turbo"},
-		"anthropic": {"claude-sonnet-4", "claude-3-5-sonnet-20241022"},
+	rec := map[string][]string{
+		"openai":    {"gpt-4o", "gpt-4o-mini"},
+		"anthropic": {"claude-opus-4-7", "claude-sonnet-4-6"},
 		"groq":      {"llama3-70b-8192", "mixtral-8x7b-32768"},
-		"gemini":    {"gemini-1.5-pro", "gemini-pro"},
-		"ollama":    {"llama2", "mistral"},
+		"gemini":    {"gemini-1.5-pro", "gemini-1.5-flash"},
+		"ollama":    {"llama3", "mistral"},
 	}
-
-	for _, r := range recommended[provider] {
+	for _, r := range rec[provider] {
 		if model == r {
 			return true
 		}

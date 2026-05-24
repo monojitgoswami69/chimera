@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"net/url"
 	"os"
@@ -11,80 +12,110 @@ import (
 	"strings"
 )
 
-// Clone clones a repository using git command
-func Clone(ctx context.Context, repoURL, targetDir, pat string) error {
-	// Validate URL
-	if !IsValidGitHubURL(repoURL) {
-		return fmt.Errorf("invalid GitHub URL: must match https://github.com/<owner>/<repo>")
-	}
-
-	// If PAT is provided, inject it into the URL
-	cloneURL := repoURL
-	if pat != "" {
-		cloneURL = injectPAT(repoURL, pat)
-	}
-
-	// Execute git clone
-	cmd := exec.CommandContext(ctx, "git", "clone", "--depth=1", cloneURL, targetDir)
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
-	}
-
-	return nil
+// ParsedURL describes a GitHub repository reference.
+type ParsedURL struct {
+	Owner  string
+	Repo   string
+	Branch string // optional — set when the URL pointed at a /tree/<branch>/...
+	Subdir string // optional — when /tree/<branch>/<subdir> was given
+	Clone  string // canonical https clone URL
 }
 
-// ExtractRepoName extracts repository name from URL
-func ExtractRepoName(repoURL string) string {
-	// Handle SSH URLs (git@github.com:user/repo.git)
-	if strings.HasPrefix(repoURL, "git@") {
-		parts := strings.Split(repoURL, ":")
-		if len(parts) == 2 {
-			path := parts[1]
-			path = strings.TrimSuffix(path, ".git")
-			pathParts := strings.Split(path, "/")
-			if len(pathParts) > 0 {
-				return pathParts[len(pathParts)-1]
-			}
-		}
-		return ""
-	}
+var (
+	httpsRepoRe = regexp.MustCompile(`^https?://github\.com/([a-zA-Z0-9][a-zA-Z0-9_.-]*)/([a-zA-Z0-9][a-zA-Z0-9_.-]*?)(?:\.git)?/?$`)
+	httpsTreeRe = regexp.MustCompile(`^https?://github\.com/([a-zA-Z0-9][a-zA-Z0-9_.-]*)/([a-zA-Z0-9][a-zA-Z0-9_.-]*)/tree/([^/]+)(?:/(.*))?$`)
+	sshRepoRe   = regexp.MustCompile(`^git@github\.com:([a-zA-Z0-9][a-zA-Z0-9_.-]*)/([a-zA-Z0-9][a-zA-Z0-9_.-]*?)(?:\.git)?$`)
+)
 
-	// Handle HTTPS URLs
-	parsedURL, err := url.Parse(repoURL)
+// ParseURL accepts GitHub URLs in any common shape:
+//
+//	https://github.com/<owner>/<repo>
+//	https://github.com/<owner>/<repo>.git
+//	https://github.com/<owner>/<repo>/tree/<branch>[/<subdir>]
+//	git@github.com:<owner>/<repo>[.git]
+func ParseURL(s string) (*ParsedURL, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil, fmt.Errorf("empty URL")
+	}
+	if m := httpsTreeRe.FindStringSubmatch(s); m != nil {
+		p := &ParsedURL{Owner: m[1], Repo: strings.TrimSuffix(m[2], ".git"), Branch: m[3], Subdir: m[4]}
+		p.Clone = fmt.Sprintf("https://github.com/%s/%s.git", p.Owner, p.Repo)
+		return p, nil
+	}
+	if m := httpsRepoRe.FindStringSubmatch(s); m != nil {
+		p := &ParsedURL{Owner: m[1], Repo: strings.TrimSuffix(m[2], ".git")}
+		p.Clone = fmt.Sprintf("https://github.com/%s/%s.git", p.Owner, p.Repo)
+		return p, nil
+	}
+	if m := sshRepoRe.FindStringSubmatch(s); m != nil {
+		p := &ParsedURL{Owner: m[1], Repo: strings.TrimSuffix(m[2], ".git")}
+		p.Clone = fmt.Sprintf("https://github.com/%s/%s.git", p.Owner, p.Repo)
+		return p, nil
+	}
+	return nil, fmt.Errorf("not a GitHub URL: %q", s)
+}
+
+// IsValidGitHubURL returns true if the string parses as a recognised GitHub URL.
+func IsValidGitHubURL(s string) bool {
+	_, err := ParseURL(s)
+	return err == nil
+}
+
+// ExtractRepoName returns just the repo name, or "" on failure.
+func ExtractRepoName(s string) string {
+	p, err := ParseURL(s)
 	if err != nil {
 		return ""
 	}
+	return p.Repo
+}
 
-	path := strings.TrimSuffix(parsedURL.Path, ".git")
-	path = strings.TrimPrefix(path, "/")
-
-	parts := strings.Split(path, "/")
-	if len(parts) > 0 {
-		return parts[len(parts)-1]
+// Clone clones a repository to targetDir. PAT is supplied via http.extraheader
+// so it never appears on the command line as part of the URL and never gets
+// stored in .git/config.
+func Clone(ctx context.Context, repoURL, targetDir, pat string) error {
+	parsed, err := ParseURL(repoURL)
+	if err != nil {
+		return err
 	}
 
-	return ""
+	args := []string{}
+	if pat != "" {
+		auth := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + pat))
+		args = append(args, "-c", "http.https://github.com/.extraheader=Authorization: Basic "+auth)
+	}
+
+	args = append(args, "clone", "--depth=1")
+	if parsed.Branch != "" {
+		args = append(args, "--branch", parsed.Branch, "--single-branch")
+	}
+	args = append(args, parsed.Clone, targetDir)
+
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Stderr = os.Stderr
+	// Avoid asking the user for credentials interactively when the PAT is wrong.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+
+	if err := cmd.Run(); err != nil {
+		// Scrub the PAT from the URL just in case it crept into the error path.
+		msg := err.Error()
+		if pat != "" {
+			msg = strings.ReplaceAll(msg, pat, "***")
+		}
+		return fmt.Errorf("git clone failed: %s", msg)
+	}
+
+	// Defensive: strip any extraheader that git might have persisted into .git/config.
+	cleanup := exec.Command("git", "-C", targetDir, "config", "--unset-all", "http.https://github.com/.extraheader")
+	_ = cleanup.Run()
+	return nil
 }
 
-// IsValidGitHubURL validates that the URL matches GitHub pattern
-func IsValidGitHubURL(repoURL string) bool {
-	pattern := regexp.MustCompile(`^https://github\.com/[a-zA-Z0-9_-]+/[a-zA-Z0-9_.-]+(?:\.git)?$`)
-	return pattern.MatchString(repoURL)
-}
-
-// injectPAT injects a Personal Access Token into the GitHub URL
-func injectPAT(repoURL, pat string) string {
-	// Convert https://github.com/owner/repo to https://<PAT>@github.com/owner/repo
-	return strings.Replace(repoURL, "https://", fmt.Sprintf("https://%s@", pat), 1)
-}
-
-// CountFiles counts files in a directory
+// CountFiles walks dir and returns (count, total-bytes). Errors are skipped.
 func CountFiles(dir string) (int, int64, error) {
 	var count int
 	var size int64
-
 	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return nil
@@ -95,6 +126,18 @@ func CountFiles(dir string) (int, int64, error) {
 		}
 		return nil
 	})
-
 	return count, size, err
+}
+
+// SanitizeRepoName makes a name safe for use as a directory/compose service name.
+func SanitizeRepoName(name string) string {
+	if name == "" {
+		return ""
+	}
+	// strip query / fragment if someone passed a URL string
+	if u, err := url.Parse(name); err == nil && u.Path != "" {
+		name = filepath.Base(u.Path)
+	}
+	name = strings.TrimSuffix(name, ".git")
+	return name
 }

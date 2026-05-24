@@ -4,59 +4,68 @@ import (
 	"fmt"
 	"os"
 
+	"chimera/internal/ui"
+
 	"github.com/spf13/cobra"
 )
 
 var (
-	// Version is set during build via ldflags
-	Version = "v0.1.0"
-	// BuildTime is set during build via ldflags
+	// Version is set during build via ldflags.
+	Version = "v0.2.0"
+	// BuildTime is set during build via ldflags.
 	BuildTime = "unknown"
 )
 
 var rootCmd = &cobra.Command{
-	Use:   "chimera",
-	Short: "Autonomous environment orchestration for any GitHub repository",
-	Long:  `Chimera autonomously clones, analyzes, and generates Docker configurations for GitHub repositories.`,
-	Version: Version,
+	Use:           "chimera",
+	Short:         "Autonomous environment orchestration for any GitHub repository",
+	Long:          `Chimera clones a GitHub repository, detects the stack, and generates a runnable Docker environment.`,
+	Version:       Version,
+	SilenceErrors: true,
+	SilenceUsage:  true,
 	Run: func(cmd *cobra.Command, args []string) {
 		showHelp()
 	},
 }
 
 func Execute() {
-	// Disable default completion command
 	rootCmd.CompletionOptions.DisableDefaultCmd = true
-	
+
+	// Honour NO_COLOR convention and --no-color flag before any output.
+	rootCmd.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		noColor, _ := cmd.Flags().GetBool("no-color")
+		if noColor || os.Getenv("NO_COLOR") != "" {
+			ui.SetNoColor()
+		}
+	}
+
 	if err := rootCmd.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, ui.ErrorLine(err.Error()))
 		os.Exit(1)
 	}
 }
 
 func init() {
-	// Disable auto-generated help command (we have our own)
 	rootCmd.SetHelpCommand(&cobra.Command{Hidden: true})
-	
-	// Global flags
+
 	rootCmd.PersistentFlags().BoolP("verbose", "v", false, "Enable verbose output (show LLM responses, detailed logs)")
 	rootCmd.PersistentFlags().BoolP("quiet", "q", false, "Suppress non-error output")
-	
-	// Set custom version template
+	rootCmd.PersistentFlags().Bool("no-color", false, "Disable ANSI colors in output")
+
 	rootCmd.SetVersionTemplate(fmt.Sprintf("Chimera %s (built %s)\n", Version, BuildTime))
-	
+
 	rootCmd.AddCommand(helpCmd)
 	rootCmd.AddCommand(setupCmd)
 	rootCmd.AddCommand(initCmd)
 }
 
-// GetVerbose returns whether verbose mode is enabled
+// GetVerbose returns whether verbose mode is enabled.
 func GetVerbose(cmd *cobra.Command) bool {
 	verbose, _ := cmd.Flags().GetBool("verbose")
 	return verbose
 }
 
-// GetQuiet returns whether quiet mode is enabled
+// GetQuiet returns whether quiet mode is enabled.
 func GetQuiet(cmd *cobra.Command) bool {
 	quiet, _ := cmd.Flags().GetBool("quiet")
 	return quiet

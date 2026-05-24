@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,113 +18,101 @@ import (
 	"chimera/internal/generator"
 	"chimera/internal/git"
 	"chimera/internal/llm"
+	"chimera/internal/safefs"
 	"chimera/internal/tree"
 	"chimera/internal/ui"
 
 	"github.com/spf13/cobra"
 )
 
+const outputSubdir = "chimera-outputs"
+
 var initCmd = &cobra.Command{
 	Use:   "init <github-url>",
 	Short: "Clone and orchestrate a GitHub repository",
-	Long: `Clone a GitHub repository, analyze its stack, and generate Docker configurations.
+	Long: `Clone a GitHub repository, analyse its stack, and generate runnable Docker configurations.
 
-By default, this command will:
-  1. Clone the repository to ~/.chimera/repos/<repo-name>/
-  2. Generate a smart file tree (excluding node_modules, venv, etc.)
-  3. Detect technologies and frameworks (JS/TS, Python)
-  4. Validate findings with LLM (unless --no-agent is used)
-  5. Generate Dockerfile and docker-compose.yml
-  6. Extract environment variables
-  7. Write everything to chimera-outputs/
+URL forms accepted:
+  https://github.com/<owner>/<repo>
+  https://github.com/<owner>/<repo>.git
+  https://github.com/<owner>/<repo>/tree/<branch>[/<subdir>]
+  git@github.com:<owner>/<repo>[.git]
 
 Flags:
-  --force       Force re-initialization even if directory exists
-  --no-agent    Disable LLM validation (use static analysis only)
-
-Examples:
-  chimera init https://github.com/tiangolo/fastapi
-  chimera init https://github.com/user/repo --force
-  chimera init https://github.com/user/repo --no-agent
-  chimera init https://github.com/user/repo --force --no-agent`,
-	Args:  cobra.ExactArgs(1),
+  --force       Force re-initialisation even if the cloned directory exists
+  --no-agent    Disable LLM validation (use static analysis only — works without setup)
+  --output      Override the output directory (default: chimera-outputs)
+`,
+	Args: cobra.ExactArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
 		if err := runInit(cmd, args[0]); err != nil {
 			fmt.Println()
-			errorBox := ui.ErrorBox.Render(fmt.Sprintf("Error: %s", err.Error()))
-			fmt.Println(errorBox)
+			fmt.Println(ui.ErrorBox.Render(fmt.Sprintf("Error: %s", err.Error())))
 			os.Exit(1)
 		}
 	},
 }
 
 var (
-	initForce    bool
-	initNoAgent  bool
+	initForce       bool
+	initNoAgent     bool
+	initOutputDir   string
+	initKeepRepoDir bool
+	initMaxServices int
 )
 
 func init() {
-	initCmd.Flags().BoolVar(&initForce, "force", false, "Force re-initialization even if directory exists")
+	initCmd.Flags().BoolVar(&initForce, "force", false, "Force re-initialisation even if directory exists")
 	initCmd.Flags().BoolVar(&initNoAgent, "no-agent", false, "Disable LLM validation (use static analysis only)")
+	initCmd.Flags().StringVar(&initOutputDir, "output", outputSubdir, "Output sub-directory (relative to the repo root)")
+	initCmd.Flags().IntVar(&initMaxServices, "max-services", detector.MaxServices, "Cap on the number of detected services")
 }
 
 func runInit(cmd *cobra.Command, repoURL string) error {
 	ctx := context.Background()
 	start := time.Now()
 
-	// Get flags
 	verbose := GetVerbose(cmd)
 	quiet := GetQuiet(cmd)
 
-	// Print banner (unless quiet)
 	if !quiet {
-		fmt.Print(ui.Header("init"))
+		fmt.Print(ui.Header(ui.HeaderArgs{Command: "init", Version: Version}))
 	}
 
-	// PRE-FLIGHT CHECK
-	if !quiet {
-		fmt.Println(ui.InfoLine("Pre-flight checks..."))
-	}
-
-	cfg, err := config.Load()
+	// Pre-flight
+	parsed, err := git.ParseURL(repoURL)
 	if err != nil {
-		return fmt.Errorf("Chimera is not configured.\nRun  chimera setup  first to choose a provider and set your API key")
+		return err
 	}
 
-	if !git.IsValidGitHubURL(repoURL) {
-		return fmt.Errorf("invalid GitHub URL: must match https://github.com/<owner>/<repo>")
-	}
-
-	repoName := git.ExtractRepoName(repoURL)
-	if repoName == "" {
-		return fmt.Errorf("could not extract repository name from URL")
-	}
-
-	if !quiet {
-		fmt.Println(ui.SuccessLine("Configuration loaded"))
-		fmt.Println()
-	}
-
-	// STEP 1: CLONE
-	if !quiet {
-		fmt.Println(ui.InfoLine(fmt.Sprintf("Cloning %s...", ui.HighlightStyle.Render(repoName))))
+	var cfg *config.Config
+	if initNoAgent {
+		cfg = config.LoadOptional() // returns empty struct when not configured
+		if !quiet {
+			fmt.Println(ui.InfoLine("Static-only mode (--no-agent) — LLM configuration not required."))
+		}
+	} else {
+		cfg, err = config.Load()
+		if err != nil {
+			return fmt.Errorf("%s\n\nrun  chimera setup  to configure a provider, or pass --no-agent to skip the LLM", err)
+		}
+		if !quiet {
+			fmt.Println(ui.SuccessLine("Configuration loaded"))
+		}
 	}
 
 	reposDir, err := config.ReposDir()
 	if err != nil {
 		return err
 	}
-
 	if err := os.MkdirAll(reposDir, 0755); err != nil {
 		return fmt.Errorf("failed to create repos directory: %w", err)
 	}
+	targetDir := filepath.Join(reposDir, parsed.Repo)
 
-	targetDir := filepath.Join(reposDir, repoName)
-
-	// Check if directory exists
 	if _, err := os.Stat(targetDir); err == nil {
 		if !initForce {
-			return fmt.Errorf("directory %s already exists. Use --force to re-initialize", targetDir)
+			return fmt.Errorf("%s already exists — use --force to re-initialise", targetDir)
 		}
 		if !quiet {
 			fmt.Println(ui.WarningLine("Removing existing directory (--force)"))
@@ -131,500 +122,503 @@ func runInit(cmd *cobra.Command, repoURL string) error {
 		}
 	}
 
-	// Clone the repository
-	if err := git.Clone(ctx, repoURL, targetDir, cfg.GitHubPAT); err != nil {
-		return fmt.Errorf("git clone failed: %w", err)
+	// Step 1: clone
+	if !quiet {
+		fmt.Println(ui.Step(1, 6, "Clone repository"))
 	}
-
+	var sp *ui.Spinner
+	if !quiet {
+		sp = ui.StartSpinner(fmt.Sprintf("Cloning %s...", parsed.Owner+"/"+parsed.Repo))
+	}
+	cloneErr := git.Clone(ctx, parsed.Clone, targetDir, cfg.GitHubPAT)
+	if sp != nil {
+		sp.Stop()
+	}
+	if cloneErr != nil {
+		return cloneErr
+	}
 	fileCount, size, _ := git.CountFiles(targetDir)
-	sizeMB := float64(size) / 1024 / 1024
 	if !quiet {
-		fmt.Println(ui.SuccessLine(fmt.Sprintf("Cloned %s (%d files, %.1f MB)", repoName, fileCount, sizeMB)))
-		fmt.Println()
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("%s cloned (%d files · %.1f MB)", parsed.Repo, fileCount, float64(size)/1024/1024)))
 	}
 
-	// STEP 2: TREE GENERATION
+	// Step 2: tree
 	if !quiet {
-		fmt.Println(ui.InfoLine("Generating file tree..."))
+		fmt.Println(ui.Step(2, 6, "Generate repository tree"))
 	}
-
 	treeStr, totalLines, err := tree.Generate(targetDir, 10000)
 	if err != nil {
 		return fmt.Errorf("tree generation failed: %w", err)
 	}
-
 	if !quiet {
-		fmt.Println(ui.SuccessLine(fmt.Sprintf("Generated tree (%d lines)", totalLines)))
-		fmt.Println()
-		
-		// Display tree
-		fmt.Println(ui.BoldStyle.Render("Repository Structure:"))
-		fmt.Println()
-		treeLines := strings.Split(treeStr, "\n")
-		displayLines := treeLines
-		if len(treeLines) > 60 && !verbose {
-			displayLines = treeLines[:60]
-		}
-		for _, line := range displayLines {
-			if line != "" {
-				fmt.Println(ui.DimStyle.Render("  " + line))
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Tree generated (%d lines)", totalLines)))
+		if verbose {
+			for _, line := range strings.Split(treeStr, "\n") {
+				if line != "" {
+					fmt.Println(ui.DimStyle.Render("  " + line))
+				}
 			}
 		}
-		if len(treeLines) > 60 && !verbose {
-			fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  ... (%d more lines, use --verbose to see all)", len(treeLines)-60)))
-		}
-		fmt.Println()
 	}
 
-	// STEP 3: STATIC ANALYSIS
+	// Step 3: detection
 	if !quiet {
-		fmt.Println(ui.InfoLine("Analyzing technology stack..."))
+		fmt.Println(ui.Step(3, 6, "Detect services and frameworks"))
 	}
-
-	detectionResult, err := detector.Detect(targetDir)
+	detection, err := detector.DetectWithCap(targetDir, initMaxServices)
 	if err != nil {
 		return fmt.Errorf("detection failed: %w", err)
 	}
-
-	if len(detectionResult.Services) == 0 {
-		warningBox := ui.WarningBox.Render(
+	if len(detection.Services) == 0 {
+		fmt.Println(ui.WarningBox.Render(
 			"No supported project types detected.\n\n" +
-				"Chimera currently supports: Node.js/Express/Next.js, Python/FastAPI/Flask/Django.\n\n" +
+				"Chimera currently supports Node-based (Next, React, Vite, Express, NestJS, etc.) and Python (FastAPI, Flask, Django).\n\n" +
 				"If this repo uses a supported technology, please open an issue.",
-		)
-		fmt.Println(warningBox)
+		))
 		return nil
 	}
-
 	if !quiet {
-		fmt.Println(ui.SuccessLine(fmt.Sprintf("Detected %d service(s) via static analysis", len(detectionResult.Services))))
-		fmt.Println()
-		
-		// Display detection summary
-		fmt.Println(ui.BoldStyle.Render("Detected Services:"))
-		fmt.Println()
-		table := &ui.Table{
-			Headers: []string{"Type", "Directory", "Technology", "Confidence"},
-			Rows:    [][]string{},
+		printDetectionTable(detection)
+		if detection.TruncatedFrom > 0 {
+			fmt.Println(ui.WarningLine(fmt.Sprintf(
+				"Found %d candidate services — kept the top %d by confidence. Re-run with --max-services to adjust.",
+				detection.TruncatedFrom, len(detection.Services),
+			)))
 		}
-
-		for _, svc := range detectionResult.Services {
-			typeStr := svc.Type
-			if svc.Type == "frontend" {
-				typeStr = ui.HighlightStyle.Render("Frontend")
-			} else {
-				typeStr = ui.PrimaryStyle.Render("Backend")
-			}
-
-			dir := svc.Directory
-			if dir == "" {
-				dir = "."
-			}
-
-			table.Rows = append(table.Rows, []string{
-				typeStr,
-				dir,
-				svc.Framework,
-				ui.ConfidenceBar(svc.Confidence),
-			})
-		}
-
-		fmt.Println(table.Render())
-		fmt.Println()
 	}
 
-	// STEP 4: LLM VALIDATION OF DETECTION (unless --no-agent)
+	// LLM validation of detection
 	if !initNoAgent {
+		var sp *ui.Spinner
 		if !quiet {
-			fmt.Println(ui.InfoLine("Validating detection with LLM..."))
+			sp = ui.StartSpinner("Validating detection with LLM...")
 		}
-
-		llmClient, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
-		if err != nil {
-			if !quiet {
-				fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation skipped: %v", err)))
-			}
-		} else {
-			detectionJSON, _ := detectionResult.ToJSON()
-			
-			// File reader function
-			fileReader := func(path string) (string, error) {
-				if verbose {
-					fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  → Reading %s", path)))
-				}
-				fullPath := filepath.Join(targetDir, path)
-				content, err := os.ReadFile(fullPath)
-				if err != nil {
-					return "", err
-				}
-				return string(content), nil
-			}
-
-			validationResp, err := llmClient.ValidateDetection(ctx, treeStr, detectionJSON, fileReader)
-			if err != nil {
-				if !quiet {
-					fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation failed: %v", err)))
-				}
-			} else if validationResp.Valid {
-				if !quiet {
-					fmt.Println(ui.SuccessLine("LLM confirmed detection"))
-				}
-			} else if len(validationResp.CorrectedServices) > 0 {
-				if !quiet {
-					fmt.Println(ui.SuccessLine("LLM provided corrections"))
-				}
-				
-				// Convert LLM corrections to detector.Service format
-				correctedServices := make([]detector.Service, 0, len(validationResp.CorrectedServices))
-				for i, corrected := range validationResp.CorrectedServices {
-					confidenceStr := "medium"
-					if corrected.Confidence >= 0.9 {
-						confidenceStr = "high"
-					} else if corrected.Confidence < 0.6 {
-						confidenceStr = "low"
-					}
-					
-					language := "unknown"
-					if corrected.Framework == "next" || corrected.Framework == "express" || corrected.Framework == "node" {
-						language = "javascript"
-					} else if corrected.Framework == "fastapi" || corrected.Framework == "flask" || corrected.Framework == "django" {
-						language = "python"
-					}
-					
-					correctedServices = append(correctedServices, detector.Service{
-						ID:         fmt.Sprintf("service-%d", i+1),
-						Type:       corrected.Type,
-						Directory:  corrected.Directory,
-						Language:   language,
-						Framework:  corrected.Framework,
-						Confidence: confidenceStr,
-						IdentifierFiles: []string{},
-					})
-				}
-				
-				detectionResult.Services = correctedServices
-			}
+		err := llmValidateDetection(ctx, cfg, detection, treeStr, targetDir, quiet, verbose)
+		if sp != nil {
+			sp.Stop()
 		}
-		if !quiet {
-			fmt.Println()
-		}
-	} else {
-		if !quiet {
-			fmt.Println(ui.InfoLine("LLM validation skipped (--no-agent mode)"))
-			fmt.Println()
+		if err != nil && !quiet {
+			fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation skipped: %v", err)))
 		}
 	}
 
-	// STEP 5: DOCKERFILE & COMPOSE GENERATION
+	// Step 4: generation
 	if !quiet {
-		fmt.Println(ui.InfoLine("Generating Docker configurations..."))
+		fmt.Println(ui.Step(4, 6, "Generate Dockerfile(s) and docker-compose.yml"))
 	}
-
-	dockerfile := generator.GenerateMultiStage(detectionResult.Services)
-	composeFile := generator.GenerateCompose(detectionResult.Services, repoName)
-
+	out := generator.Build(detection.Services, parsed.Repo, initOutputDir)
 	if !quiet {
-		fmt.Println(ui.SuccessLine("Generated Dockerfile and docker-compose.yml"))
-		fmt.Println()
+		for _, name := range generator.SortedFilenames(out.Files) {
+			fmt.Println(ui.SuccessLine("  " + initOutputDir + "/" + name))
+		}
 	}
 
-	// STEP 6: LLM VALIDATION OF DOCKERFILES (unless --no-agent)
+	// LLM validation of Docker configs (optional)
 	if !initNoAgent {
+		var sp *ui.Spinner
 		if !quiet {
-			fmt.Println(ui.InfoLine("Validating Docker configurations with LLM..."))
+			sp = ui.StartSpinner("Validating Dockerfile and compose with LLM...")
 		}
-
-		llmClient, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
-		if err != nil {
-			if !quiet {
-				fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation skipped: %v", err)))
-			}
-		} else {
-			fileReader := func(path string) (string, error) {
-				if verbose {
-					fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  → Reading %s", path)))
-				}
-				fullPath := filepath.Join(targetDir, path)
-				content, err := os.ReadFile(fullPath)
-				if err != nil {
-					return "", err
-				}
-				return string(content), nil
-			}
-
-			validationResp, err := llmClient.ValidateDockerfiles(ctx, treeStr, dockerfile, composeFile, fileReader)
-			if err != nil {
-				if !quiet {
-					fmt.Println(ui.WarningLine(fmt.Sprintf("LLM validation failed: %v", err)))
-				}
-			} else if validationResp.Valid {
-				if !quiet {
-					fmt.Println(ui.SuccessLine("LLM confirmed Docker configurations"))
-				}
-			} else {
-				if validationResp.CorrectedDockerfile != "" {
-					if !quiet {
-						fmt.Println(ui.SuccessLine("LLM corrected Dockerfile"))
-					}
-					dockerfile = validationResp.CorrectedDockerfile
-				}
-				if validationResp.CorrectedCompose != "" {
-					if !quiet {
-						fmt.Println(ui.SuccessLine("LLM corrected docker-compose.yml"))
-					}
-					composeFile = validationResp.CorrectedCompose
-				}
-			}
+		err := llmValidateDocker(ctx, cfg, out, treeStr, targetDir, quiet, verbose)
+		if sp != nil {
+			sp.Stop()
 		}
-		if !quiet {
-			fmt.Println()
+		if err != nil && !quiet {
+			fmt.Println(ui.WarningLine(fmt.Sprintf("LLM Docker validation skipped: %v", err)))
 		}
 	}
 
-	// STEP 7: ENV VAR DETECTION
+	// Step 5: env vars
 	if !quiet {
-		fmt.Println(ui.InfoLine("Detecting environment variables..."))
+		fmt.Println(ui.Step(5, 6, "Extract environment variables"))
 	}
-
-	envResults := envvar.Detect(targetDir, detectionResult.Services)
-
+	envResults := envvar.Detect(targetDir, detection.Services)
 	totalVars := 0
-	for _, result := range envResults {
-		totalVars += len(result.Vars)
+	for _, r := range envResults {
+		totalVars += len(r.Vars)
 	}
-
 	if !quiet {
-		fmt.Println(ui.SuccessLine(fmt.Sprintf("Detected %d environment variable(s)", totalVars)))
-		fmt.Println()
+		fmt.Println(ui.SuccessLine(fmt.Sprintf("Detected %d variable reference(s) across %d service(s)", totalVars, len(envResults))))
 	}
-
-	// STEP 8: LLM VALIDATION OF ENV VARS (unless --no-agent)
 	if !initNoAgent {
+		var sp *ui.Spinner
 		if !quiet {
-			fmt.Println(ui.InfoLine("Enhancing environment variables with LLM..."))
+			sp = ui.StartSpinner("Enhancing env files with LLM...")
 		}
-
-		llmClient, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
-		if err != nil {
-			if !quiet {
-				fmt.Println(ui.WarningLine(fmt.Sprintf("LLM enhancement skipped: %v", err)))
-			}
-		} else {
-			// Check for existing .env files
-			existingEnvFiles := findExistingEnvFiles(targetDir)
-			existingEnvContent := ""
-			if len(existingEnvFiles) > 0 {
-				if !quiet {
-					fmt.Println(ui.InfoLine(fmt.Sprintf("Found %d existing .env file(s)", len(existingEnvFiles))))
-				}
-				var envBuilder strings.Builder
-				for _, envFile := range existingEnvFiles {
-					content, err := os.ReadFile(filepath.Join(targetDir, envFile))
-					if err == nil {
-						envBuilder.WriteString(fmt.Sprintf("\n=== %s ===\n%s\n", envFile, string(content)))
-					}
-				}
-				existingEnvContent = envBuilder.String()
-			}
-
-			// Convert env results to JSON
-			envJSON, _ := json.Marshal(envResults)
-
-			fileReader := func(path string) (string, error) {
-				if verbose {
-					fmt.Println(ui.DimStyle.Render(fmt.Sprintf("  → Reading %s", path)))
-				}
-				fullPath := filepath.Join(targetDir, path)
-				content, err := os.ReadFile(fullPath)
-				if err != nil {
-					return "", err
-				}
-				return string(content), nil
-			}
-
-			validationResp, err := llmClient.ValidateEnvVars(ctx, treeStr, string(envJSON), existingEnvContent, fileReader)
-			if err != nil {
-				if !quiet {
-					fmt.Println(ui.WarningLine(fmt.Sprintf("LLM enhancement failed: %v", err)))
-				}
-			} else if len(validationResp.CorrectedEnvVars) > 0 {
-				if !quiet {
-					fmt.Println(ui.SuccessLine("LLM enhanced environment variables"))
-				}
-				
-				// Replace env results with LLM-enhanced versions
-				envResults = make([]envvar.Result, 0, len(validationResp.CorrectedEnvVars))
-				for _, corrected := range validationResp.CorrectedEnvVars {
-					envResults = append(envResults, envvar.Result{
-						Directory:   corrected.Directory,
-						ServiceType: corrected.ServiceType,
-						Technology:  corrected.Technology,
-						Vars:        []envvar.EnvVar{},
-						EnvContent:  corrected.EnvContent,
-					})
-				}
-			}
+		err := llmValidateEnvVars(ctx, cfg, &envResults, treeStr, targetDir, quiet, verbose)
+		if sp != nil {
+			sp.Stop()
 		}
-		if !quiet {
-			fmt.Println()
+		if err != nil && !quiet {
+			fmt.Println(ui.WarningLine(fmt.Sprintf("LLM env enhancement skipped: %v", err)))
 		}
 	}
 
-	// STEP 9: WRITE chimera-outputs/
+	// Reconcile: if the env content (static or LLM-enhanced) declares a PORT,
+	// propagate it to the service so the Dockerfile/compose stay consistent.
+	if reconcilePortsFromEnv(detection.Services, envResults) {
+		if !quiet {
+			fmt.Println(ui.InfoLine("Updated service ports from .env content"))
+		}
+		out = generator.Build(detection.Services, parsed.Repo, initOutputDir)
+	}
+
+	// Step 6: write outputs
 	if !quiet {
-		fmt.Println(ui.InfoLine("Writing output files..."))
+		fmt.Println(ui.Step(6, 6, "Write outputs"))
 	}
-
-	outputDir := filepath.Join(targetDir, "chimera-outputs")
+	outputDir := filepath.Join(targetDir, initOutputDir)
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	// Write Dockerfile
-	dockerfilePath := filepath.Join(outputDir, "Dockerfile")
-	if err := os.WriteFile(dockerfilePath, []byte(dockerfile), 0644); err != nil {
-		return fmt.Errorf("failed to write Dockerfile: %w", err)
-	}
-	if !quiet {
-		fmt.Println(ui.SuccessLine("  ✓ Dockerfile"))
+	for _, name := range generator.SortedFilenames(out.Files) {
+		dest := filepath.Join(outputDir, name)
+		if err := os.WriteFile(dest, []byte(out.Files[name]), 0644); err != nil {
+			return fmt.Errorf("failed to write %s: %w", name, err)
+		}
 	}
 
-	// Write docker-compose.yml
-	composePath := filepath.Join(outputDir, "docker-compose.yml")
-	if err := os.WriteFile(composePath, []byte(composeFile), 0644); err != nil {
-		return fmt.Errorf("failed to write docker-compose.yml: %w", err)
-	}
-	if !quiet {
-		fmt.Println(ui.SuccessLine("  ✓ docker-compose.yml"))
-	}
-
-	// Write .gitignore
-	gitignorePath := filepath.Join(outputDir, ".gitignore")
-	if err := os.WriteFile(gitignorePath, []byte("*\n"), 0644); err != nil {
+	// .gitignore so the user doesn't accidentally commit the generated tree
+	if err := os.WriteFile(filepath.Join(outputDir, ".gitignore"), []byte("# managed by chimera\n*\n!.gitignore\n!README.md\n!Dockerfile.*\n!docker-compose.yml\n!quick_start.md\n!env-vars/\n"), 0644); err != nil {
 		return fmt.Errorf("failed to write .gitignore: %w", err)
 	}
-	if !quiet {
-		fmt.Println(ui.SuccessLine("  ✓ .gitignore"))
-	}
 
-	// Write env vars
+	// env files
 	for _, envResult := range envResults {
-		serviceName := strings.ReplaceAll(envResult.Directory, "/", "-")
-		if serviceName == "" {
-			serviceName = "root"
-		}
-		serviceName = strings.ToLower(serviceName)
-
-		envDir := filepath.Join(outputDir, "env-vars", serviceName)
+		envDir := filepath.Join(outputDir, "env-vars", envResult.ServiceID)
 		if err := os.MkdirAll(envDir, 0755); err != nil {
 			return fmt.Errorf("failed to create env-vars directory: %w", err)
 		}
-
-		var envContent string
-		if envResult.EnvContent != "" {
-			// Use LLM-generated content
-			envContent = envResult.EnvContent
+		var content string
+		if strings.TrimSpace(envResult.EnvContent) != "" {
+			content = envResult.EnvContent
 		} else {
-			// Use static generation
-			envContent = envvar.GenerateEnvExample(envResult.Vars, envResult.Technology)
+			content = envvar.GenerateEnvExample(envResult.Vars, envResult.Technology)
 		}
-
 		envPath := filepath.Join(envDir, ".env.example")
-		if err := os.WriteFile(envPath, []byte(envContent), 0644); err != nil {
+		if err := os.WriteFile(envPath, []byte(content), 0644); err != nil {
 			return fmt.Errorf("failed to write .env.example: %w", err)
 		}
 		if !quiet {
-			fmt.Println(ui.SuccessLine(fmt.Sprintf("  ✓ env-vars/%s/.env.example", serviceName)))
+			fmt.Println(ui.SuccessLine(fmt.Sprintf("  %s/env-vars/%s/.env.example", initOutputDir, envResult.ServiceID)))
 		}
 	}
 
-	// Generate and write quick start guide
-	quickStartGuide := generateQuickStartGuide(repoName, detectionResult, envResults)
-	quickStartPath := filepath.Join(outputDir, "quick_start_guide.txt")
-	if err := os.WriteFile(quickStartPath, []byte(quickStartGuide), 0644); err != nil {
-		return fmt.Errorf("failed to write quick_start_guide.txt: %w", err)
+	// quick start guide
+	quickPath := filepath.Join(outputDir, "quick_start.md")
+	if err := os.WriteFile(quickPath, []byte(quickStart(parsed.Repo, detection.Services, initOutputDir)), 0644); err != nil {
+		return fmt.Errorf("failed to write quick_start.md: %w", err)
 	}
 	if !quiet {
-		fmt.Println(ui.SuccessLine("  ✓ quick_start_guide.txt"))
+		fmt.Println(ui.SuccessLine("  " + initOutputDir + "/quick_start.md"))
 	}
 
-	if !quiet {
-		fmt.Println()
-	}
-
-	// COMPLETION
 	if !quiet {
 		duration := time.Since(start)
-		completionBox := ui.SuccessBox.Render(fmt.Sprintf(
-			"Init complete for %s\n\n"+
-				"Files written to: %s\n\n"+
-				"Next steps:\n"+
-				"  1. Review chimera-outputs/env-vars/<service>/.env.example\n"+
-				"  2. Copy to .env and fill in your secrets\n"+
-				"  3. Run: docker compose -f chimera-outputs/docker-compose.yml up\n\n"+
-				"Completed in %.1fs",
-			ui.HighlightStyle.Render(repoName),
-			ui.HighlightStyle.Render(outputDir),
-			duration.Seconds(),
-		))
-
-		fmt.Println(completionBox)
+		var stepsBuilder strings.Builder
+		stepsBuilder.WriteString(fmt.Sprintf("Init complete for %s in %.1fs\n\n", ui.HighlightStyle.Render(parsed.Repo), duration.Seconds()))
+		stepsBuilder.WriteString("Files written to:\n  ")
+		stepsBuilder.WriteString(ui.HighlightStyle.Render(outputDir))
+		stepsBuilder.WriteString("\n\nNext steps:\n")
+		stepsBuilder.WriteString("  1. Edit  " + initOutputDir + "/env-vars/<service>/.env.example\n")
+		stepsBuilder.WriteString("  2. cd " + targetDir + "\n")
+		stepsBuilder.WriteString("  3. docker compose -f " + initOutputDir + "/docker-compose.yml up --build\n")
+		fmt.Println()
+		fmt.Println(ui.SuccessBox.Render(stepsBuilder.String()))
 		fmt.Println()
 	}
-
 	return nil
 }
 
-// findExistingEnvFiles searches for .env.example, .env.sample, etc.
-func findExistingEnvFiles(rootDir string) []string {
-	var envFiles []string
+func printDetectionTable(d *detector.Result) {
+	t := &ui.Table{
+		Headers: []string{"ID", "Type", "Directory", "Framework", "Port", "Confidence"},
+	}
+	for _, s := range d.Services {
+		dir := s.Directory
+		if dir == "" {
+			dir = "."
+		}
+		typeCell := ui.PrimaryStyle.Render(s.Type)
+		if s.Type == "frontend" {
+			typeCell = ui.HighlightStyle.Render(s.Type)
+		}
+		t.Rows = append(t.Rows, []string{
+			s.ID,
+			typeCell,
+			dir,
+			s.Framework,
+			fmt.Sprintf("%d", s.Port),
+			ui.ConfidenceBar(s.Confidence),
+		})
+	}
+	fmt.Println(t.Render())
+}
+
+func llmValidateDetection(ctx context.Context, cfg *config.Config, detection *detector.Result, treeStr, targetDir string, quiet, verbose bool) error {
+	client, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
+	if err != nil {
+		return err
+	}
+	reader, err := safefs.New(targetDir)
+	if err != nil {
+		return err
+	}
+	fileReader := makeFileReader(reader, verbose)
+	detJSON, _ := detection.ToJSON()
+	resp, err := client.ValidateDetection(ctx, treeStr, detJSON, fileReader)
+	if err != nil {
+		return err
+	}
+	if resp.Valid {
+		if !quiet {
+			fmt.Println(ui.SuccessLine("LLM confirmed detection"))
+		}
+		return nil
+	}
+	if len(resp.CorrectedServices) > 0 {
+		corrected := make([]detector.Service, 0, len(resp.CorrectedServices))
+		for i, c := range resp.CorrectedServices {
+			lang := "javascript"
+			switch c.Framework {
+			case "fastapi", "flask", "django", "python":
+				lang = "python"
+			}
+			conf := "medium"
+			if c.Confidence >= 0.9 {
+				conf = "high"
+			} else if c.Confidence < 0.6 {
+				conf = "low"
+			}
+			corrected = append(corrected, detector.Service{
+				ID:         fmt.Sprintf("service-%d", i+1),
+				Type:       c.Type,
+				Directory:  c.Directory,
+				Language:   lang,
+				Framework:  c.Framework,
+				Confidence: conf,
+				Port:       defaultPort(c.Framework),
+			})
+		}
+		detection.Services = corrected
+		if !quiet {
+			fmt.Println(ui.SuccessLine("LLM provided corrections to detection"))
+			printDetectionTable(detection)
+		}
+	}
+	return nil
+}
+
+func defaultPort(framework string) int {
+	switch framework {
+	case "next", "react", "express", "node", "fastify", "nest", "cra":
+		return 3000
+	case "vite":
+		return 5173
+	case "fastapi", "django":
+		return 8000
+	case "flask":
+		return 5000
+	}
+	return 8080
+}
+
+func llmValidateDocker(ctx context.Context, cfg *config.Config, out *generator.Output, treeStr, targetDir string, quiet, verbose bool) error {
+	client, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
+	if err != nil {
+		return err
+	}
+	reader, err := safefs.New(targetDir)
+	if err != nil {
+		return err
+	}
+	fileReader := makeFileReader(reader, verbose)
+
+	// Build a combined dockerfile blob for the validator.
+	var dockerBlob strings.Builder
+	names := generator.SortedFilenames(out.Files)
+	for _, n := range names {
+		if strings.HasPrefix(n, "Dockerfile.") {
+			fmt.Fprintf(&dockerBlob, "=== %s ===\n%s\n\n", n, out.Files[n])
+		}
+	}
+	composeBlob := out.Files["docker-compose.yml"]
+
+	resp, err := client.ValidateDockerfiles(ctx, treeStr, dockerBlob.String(), composeBlob, fileReader)
+	if err != nil {
+		return err
+	}
+	if resp.Valid {
+		if !quiet {
+			fmt.Println(ui.SuccessLine("LLM confirmed Docker configurations"))
+		}
+		return nil
+	}
+	if resp.CorrectedCompose != "" {
+		out.Files["docker-compose.yml"] = resp.CorrectedCompose
+		if !quiet {
+			fmt.Println(ui.SuccessLine("LLM corrected docker-compose.yml"))
+		}
+	}
+	// LLM may have returned a multi-dockerfile blob. We accept it as a single override.
+	if resp.CorrectedDockerfile != "" {
+		out.Files["Dockerfile"] = resp.CorrectedDockerfile
+		if !quiet {
+			fmt.Println(ui.WarningLine("LLM returned a corrected Dockerfile blob — saved as Dockerfile (review before use)"))
+		}
+	}
+	return nil
+}
+
+func llmValidateEnvVars(ctx context.Context, cfg *config.Config, results *[]envvar.Result, treeStr, targetDir string, quiet, verbose bool) error {
+	client, err := llm.NewClient(cfg.LLMProvider, cfg.LLMModel, cfg.LLMAPIKey)
+	if err != nil {
+		return err
+	}
+	reader, err := safefs.New(targetDir)
+	if err != nil {
+		return err
+	}
+	fileReader := makeFileReader(reader, verbose)
+
+	existingEnv := readExistingEnvFiles(reader, targetDir)
+	envJSON, _ := json.Marshal(*results)
+
+	resp, err := client.ValidateEnvVars(ctx, treeStr, string(envJSON), existingEnv, fileReader)
+	if err != nil {
+		return err
+	}
+	if len(resp.CorrectedEnvVars) == 0 {
+		return nil
+	}
+	// Map LLM corrections onto existing services by directory; fall back to ServiceID.
+	byDir := map[string]int{}
+	byID := map[string]int{}
+	for i, r := range *results {
+		byDir[r.Directory] = i
+		byID[r.ServiceID] = i
+	}
+	for _, c := range resp.CorrectedEnvVars {
+		if idx, ok := byDir[c.Directory]; ok {
+			(*results)[idx].EnvContent = c.EnvContent
+			(*results)[idx].Technology = c.Technology
+			continue
+		}
+	}
+	if !quiet {
+		fmt.Println(ui.SuccessLine("LLM enhanced environment variables"))
+	}
+	return nil
+}
+
+func makeFileReader(reader *safefs.Reader, verbose bool) func(string) (string, error) {
+	return func(p string) (string, error) {
+		if verbose {
+			fmt.Println(ui.DimStyle.Render("  → LLM reading " + p))
+		}
+		return reader.Read(p)
+	}
+}
+
+func readExistingEnvFiles(reader *safefs.Reader, targetDir string) string {
 	patterns := []string{".env.example", ".env.sample", ".env.template", ".env.local.example"}
-	
-	filepath.Walk(rootDir, func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+	var found []string
+	filepath.WalkDir(targetDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
 			return nil
 		}
-		
-		relPath, _ := filepath.Rel(rootDir, path)
-		for _, pattern := range patterns {
-			if strings.HasSuffix(info.Name(), pattern) {
-				envFiles = append(envFiles, relPath)
-				break
+		for _, p := range patterns {
+			if d.Name() == p {
+				rel, _ := filepath.Rel(targetDir, path)
+				found = append(found, rel)
+				return nil
 			}
 		}
 		return nil
 	})
-	
-	return envFiles
+	sort.Strings(found)
+	var b strings.Builder
+	for _, f := range found {
+		content, err := reader.Read(f)
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "\n=== %s ===\n%s\n", f, content)
+	}
+	return b.String()
 }
 
-func generateQuickStartGuide(projectName string, detection *detector.Result, envResults []envvar.Result) string {
-var b strings.Builder
-b.WriteString("═══════════════════════════════════════════════════════════════\n")
-b.WriteString(fmt.Sprintf("  QUICK START GUIDE - %s\n", strings.ToUpper(projectName)))
-b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-b.WriteString("DETECTED SERVICES:\n")
-for _, svc := range detection.Services {
-dir := svc.Directory
-if dir == "" {
-dir = "root"
+// reconcilePortsFromEnv scans each env file for PORT/HTTP_PORT/SERVER_PORT
+// and updates the corresponding service's runtime port. Returns true when at
+// least one port changed (so the caller knows to re-render generation).
+func reconcilePortsFromEnv(services []detector.Service, envResults []envvar.Result) bool {
+	if len(services) == 0 || len(envResults) == 0 {
+		return false
+	}
+	byID := map[string]*detector.Service{}
+	for i := range services {
+		byID[services[i].ID] = &services[i]
+	}
+	changed := false
+	portKeyRe := regexp.MustCompile(`(?m)^\s*(PORT|HTTP_PORT|SERVER_PORT|APP_PORT)\s*=\s*['"]?(\d{2,5})['"]?\s*$`)
+	for _, r := range envResults {
+		if r.EnvContent == "" {
+			continue
+		}
+		svc, ok := byID[r.ServiceID]
+		if !ok {
+			continue
+		}
+		// Static-served SPAs are always served on port 80 (nginx); ignore PORT for them.
+		switch svc.Framework {
+		case "react", "vite", "cra":
+			continue
+		}
+		m := portKeyRe.FindStringSubmatch(r.EnvContent)
+		if m == nil {
+			continue
+		}
+		p, err := strconv.Atoi(m[2])
+		if err != nil || p < 80 || p > 65535 {
+			continue
+		}
+		if svc.Port != p {
+			svc.Port = p
+			changed = true
+		}
+	}
+	return changed
 }
-b.WriteString(fmt.Sprintf("  • %s (%s) in %s/\n", svc.Framework, svc.Type, dir))
-}
-b.WriteString("\n═══════════════════════════════════════════════════════════════\n")
-b.WriteString("DOCKER SETUP (RECOMMENDED)\n")
-b.WriteString("═══════════════════════════════════════════════════════════════\n\n")
-b.WriteString("1. Configure environment:\n")
-b.WriteString("   cp chimera-outputs/env-vars/*/.env.example .env\n")
-b.WriteString("   nano .env  # Edit with your secrets\n\n")
-b.WriteString("2. Start services:\n")
-b.WriteString("   docker compose -f chimera-outputs/docker-compose.yml up -d\n\n")
-b.WriteString("3. View logs:\n")
-b.WriteString("   docker compose -f chimera-outputs/docker-compose.yml logs -f\n\n")
-b.WriteString("4. Stop services:\n")
-b.WriteString("   docker compose -f chimera-outputs/docker-compose.yml down\n\n")
-b.WriteString("═══════════════════════════════════════════════════════════════\n")
-b.WriteString("Generated by Chimera v0.1.0\n")
-b.WriteString("═══════════════════════════════════════════════════════════════\n")
-return b.String()
+
+func quickStart(repo string, services []detector.Service, outDir string) string {
+	var b strings.Builder
+	b.WriteString("# Quick Start — " + repo + "\n\n")
+	b.WriteString("Generated by Chimera " + Version + "\n\n")
+	b.WriteString("## Detected services\n\n")
+	for _, s := range services {
+		dir := s.Directory
+		if dir == "" {
+			dir = "."
+		}
+		fmt.Fprintf(&b, "- **%s** — %s (%s) in `%s/` · port %d\n", s.ID, s.Framework, s.Type, dir, s.Port)
+	}
+	b.WriteString("\n## Run\n\n")
+	b.WriteString("```sh\n")
+	b.WriteString("# 1. Edit env files\n")
+	for _, s := range services {
+		fmt.Fprintf(&b, "$EDITOR %s/env-vars/%s/.env.example\n", outDir, s.ID)
+	}
+	b.WriteString("\n# 2. Build and start\n")
+	fmt.Fprintf(&b, "docker compose -f %s/docker-compose.yml up --build\n", outDir)
+	b.WriteString("\n# 3. View logs\n")
+	fmt.Fprintf(&b, "docker compose -f %s/docker-compose.yml logs -f\n", outDir)
+	b.WriteString("\n# 4. Stop\n")
+	fmt.Fprintf(&b, "docker compose -f %s/docker-compose.yml down\n", outDir)
+	b.WriteString("```\n\n")
+	b.WriteString("## Endpoints\n\n")
+	for _, s := range services {
+		fmt.Fprintf(&b, "- %s → http://localhost:%d\n", s.ID, s.Port)
+	}
+	return b.String()
 }

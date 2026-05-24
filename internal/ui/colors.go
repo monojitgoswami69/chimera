@@ -4,13 +4,13 @@ import "github.com/charmbracelet/lipgloss"
 
 // Color palette as per specification
 var (
-	ColourPrimary   = lipgloss.Color("#7C3AED") // purple — brand colour
-	ColourSuccess   = lipgloss.Color("#10B981") // green
-	ColourWarning   = lipgloss.Color("#F59E0B") // amber
-	ColourError     = lipgloss.Color("#EF4444") // red
-	ColourMuted     = lipgloss.Color("#6B7280") // grey
-	ColourHighlight = lipgloss.Color("#60A5FA") // blue — for file paths and URLs
-	ColourDim       = lipgloss.Color("#374151") // very dark — for secondary info
+	ColourPrimary   = lipgloss.Color("#7C3AED")
+	ColourSuccess   = lipgloss.Color("#10B981")
+	ColourWarning   = lipgloss.Color("#F59E0B")
+	ColourError     = lipgloss.Color("#EF4444")
+	ColourMuted     = lipgloss.Color("#6B7280")
+	ColourHighlight = lipgloss.Color("#60A5FA")
+	ColourDim       = lipgloss.Color("#374151")
 )
 
 // Styles
@@ -43,7 +43,26 @@ var (
 			Padding(0, 1)
 
 	InfoBox = lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(ColourPrimary).
-		Padding(0, 1)
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(ColourPrimary).
+			Padding(0, 1)
 )
+
+// SetNoColor turns off all ANSI styling globally for this process.
+// Call before printing any styled content. Honours NO_COLOR convention.
+func SetNoColor() {
+	lipgloss.SetColorProfile(0) // TermenvAscii
+	plain := lipgloss.NewStyle()
+	PrimaryStyle = plain
+	SuccessStyle = plain
+	WarningStyle = plain
+	ErrorStyle = plain
+	MutedStyle = plain
+	HighlightStyle = plain
+	DimStyle = plain
+	BoldStyle = lipgloss.NewStyle().Bold(true)
+	SuccessBox = lipgloss.NewStyle().Padding(0, 1)
+	ErrorBox = lipgloss.NewStyle().Padding(0, 1)
+	WarningBox = lipgloss.NewStyle().Padding(0, 1)
+	InfoBox = lipgloss.NewStyle().Padding(0, 1)
+}

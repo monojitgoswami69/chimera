@@ -18,9 +18,9 @@ var helpCmd = &cobra.Command{
 }
 
 func showHelp() {
-	fmt.Println(ui.Header("help"))
+	fmt.Println(ui.Header(ui.HeaderArgs{Command: "help", Version: Version}))
 
-	fmt.Println(ui.BoldStyle.Render("COMMANDS"))
+	fmt.Println(ui.BoldStyle.Render("  COMMANDS"))
 	fmt.Println()
 
 	commands := []struct {
@@ -28,24 +28,43 @@ func showHelp() {
 		args string
 		desc string
 	}{
-		{"init", "<github-url>", "Clone a repo and generate its full local environment"},
 		{"setup", "", "Configure your LLM provider, API key, and GitHub access"},
+		{"init", "<github-url>", "Clone a repo and generate Docker configuration for it"},
 		{"help", "", "Show this help message"},
 	}
-
 	for _, c := range commands {
-		name := ui.PrimaryStyle.Render(c.name)
-		if c.args != "" {
-			args := ui.HighlightStyle.Render(c.args)
-			fmt.Printf("  %-6s %-15s %s\n", name, args, c.desc)
-		} else {
-			fmt.Printf("  %-22s %s\n", name, c.desc)
-		}
+		name := ui.PrimaryStyle.Render(fmt.Sprintf("%-6s", c.name))
+		args := ui.HighlightStyle.Render(fmt.Sprintf("%-15s", c.args))
+		fmt.Printf("    %s %s  %s\n", name, args, c.desc)
 	}
 
 	fmt.Println()
-	fmt.Println(ui.DimStyle.Render("Each command also supports its own help:"))
-	fmt.Println(ui.DimStyle.Render("  chimera init --help"))
-	fmt.Println(ui.DimStyle.Render("  chimera setup --help"))
+	fmt.Println(ui.BoldStyle.Render("  GLOBAL FLAGS"))
+	fmt.Println()
+	flags := []struct{ name, desc string }{
+		{"--verbose, -v", "Show detailed logs (file reads, LLM responses)"},
+		{"--quiet, -q", "Suppress non-error output (good for scripting)"},
+		{"--no-color", "Disable ANSI colors (also honours NO_COLOR env var)"},
+		{"--version", "Print version and exit"},
+	}
+	for _, f := range flags {
+		fmt.Printf("    %s  %s\n", ui.MutedStyle.Render(fmt.Sprintf("%-16s", f.name)), f.desc)
+	}
+
+	fmt.Println()
+	fmt.Println(ui.BoldStyle.Render("  EXAMPLES"))
+	fmt.Println()
+	examples := []string{
+		"chimera setup",
+		"chimera init https://github.com/tiangolo/fastapi",
+		"chimera init --no-agent https://github.com/user/repo",
+		"chimera init --force https://github.com/user/repo/tree/main/packages/web",
+	}
+	for _, e := range examples {
+		fmt.Println("    " + ui.HighlightStyle.Render(e))
+	}
+
+	fmt.Println()
+	fmt.Println(ui.DimStyle.Render("  Each command also supports --help, e.g. `chimera init --help`."))
 	fmt.Println()
 }

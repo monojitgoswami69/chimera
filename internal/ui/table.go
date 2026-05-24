@@ -1,99 +1,102 @@
 package ui
 
 import (
-	"fmt"
+	"regexp"
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Table renders a simple table
+// Table renders a simple, colour-aware table.
 type Table struct {
 	Headers []string
 	Rows    [][]string
 	Title   string
 }
 
-// Render renders the table with borders
+var ansiRe = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+// visibleWidth returns the printable width of s, ignoring ANSI escape codes.
+func visibleWidth(s string) int {
+	clean := ansiRe.ReplaceAllString(s, "")
+	w := 0
+	for range clean {
+		w++
+	}
+	return w
+}
+
+func padCell(s string, width int) string {
+	w := visibleWidth(s)
+	if w >= width {
+		return s
+	}
+	return s + strings.Repeat(" ", width-w)
+}
+
+// Render renders the table with a rounded border, padding, and a header rule.
 func (t *Table) Render() string {
 	if len(t.Rows) == 0 {
 		return ""
 	}
-
-	// Calculate column widths
-	colWidths := make([]int, len(t.Headers))
+	cols := len(t.Headers)
+	colWidths := make([]int, cols)
 	for i, h := range t.Headers {
-		colWidths[i] = len(h)
+		colWidths[i] = visibleWidth(h)
 	}
 	for _, row := range t.Rows {
-		for i, cell := range row {
-			if i < len(colWidths) && len(cell) > colWidths[i] {
-				colWidths[i] = len(cell)
+		for i := 0; i < cols && i < len(row); i++ {
+			if w := visibleWidth(row[i]); w > colWidths[i] {
+				colWidths[i] = w
 			}
 		}
 	}
 
 	var b strings.Builder
-
-	// Title
+	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(ColourPrimary)
 	if t.Title != "" {
-		titleStyle := lipgloss.NewStyle().
-			Bold(true).
-			Foreground(ColourPrimary).
-			MarginBottom(1)
-		b.WriteString(titleStyle.Render(t.Title))
+		b.WriteString(headerStyle.MarginBottom(1).Render(t.Title))
 		b.WriteString("\n")
 	}
 
-	// Headers
-	headerStyle := lipgloss.NewStyle().Bold(true).Foreground(ColourPrimary)
 	for i, h := range t.Headers {
-		b.WriteString(headerStyle.Render(padRight(h, colWidths[i])))
-		if i < len(t.Headers)-1 {
-			b.WriteString("  │  ")
+		b.WriteString(headerStyle.Render(padCell(h, colWidths[i])))
+		if i < cols-1 {
+			b.WriteString(DimStyle.Render("  │  "))
 		}
 	}
 	b.WriteString("\n")
 
-	// Separator
-	for i := range t.Headers {
-		b.WriteString(strings.Repeat("─", colWidths[i]))
-		if i < len(t.Headers)-1 {
-			b.WriteString("──┼──")
+	for i, w := range colWidths {
+		b.WriteString(DimStyle.Render(strings.Repeat("─", w)))
+		if i < cols-1 {
+			b.WriteString(DimStyle.Render("──┼──"))
 		}
 	}
 	b.WriteString("\n")
 
-	// Rows
 	for _, row := range t.Rows {
-		for i, cell := range row {
-			if i < len(colWidths) {
-				b.WriteString(padRight(cell, colWidths[i]))
-				if i < len(row)-1 {
-					b.WriteString("  │  ")
-				}
+		for i := 0; i < cols; i++ {
+			cell := ""
+			if i < len(row) {
+				cell = row[i]
+			}
+			b.WriteString(padCell(cell, colWidths[i]))
+			if i < cols-1 {
+				b.WriteString(DimStyle.Render("  │  "))
 			}
 		}
 		b.WriteString("\n")
 	}
 
-	// Wrap in box
-	boxStyle := lipgloss.NewStyle().
+	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
 		BorderForeground(ColourPrimary).
 		Padding(1, 2)
-
-	return boxStyle.Render(b.String())
+	return box.Render(strings.TrimRight(b.String(), "\n"))
 }
 
-func padRight(s string, width int) string {
-	if len(s) >= width {
-		return s
-	}
-	return s + strings.Repeat(" ", width-len(s))
-}
-
-// ConfidenceBar renders a confidence bar
+// ConfidenceBar renders a five-cell confidence bar with its label.
 func ConfidenceBar(confidence string) string {
 	var filled int
 	switch confidence {
@@ -103,12 +106,8 @@ func ConfidenceBar(confidence string) string {
 		filled = 3
 	case "low":
 		filled = 1
-	default:
-		filled = 0
 	}
-
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", 5-filled)
-
 	var style lipgloss.Style
 	switch confidence {
 	case "high":
@@ -118,6 +117,5 @@ func ConfidenceBar(confidence string) string {
 	default:
 		style = ErrorStyle
 	}
-
-	return fmt.Sprintf("%s %s", style.Render(bar), MutedStyle.Render(confidence))
+	return style.Render(bar) + " " + MutedStyle.Render(confidence)
 }

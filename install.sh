@@ -1,41 +1,32 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "Installing Chimera..."
+INSTALL_DIR="${CHIMERA_INSTALL_DIR:-$HOME/.local/bin}"
+REPO_URL="https://github.com/monojitgoswami69/chimera.git"
 
-# Check if Go is installed
-if ! command -v go &> /dev/null; then
-    echo "Error: Go is not installed. Please install Go 1.21+ first."
-    echo "Visit: https://go.dev/doc/install"
-    exit 1
-fi
+err() { echo "error: $*" >&2; exit 1; }
 
-# Create temp directory
-TMP_DIR=$(mktemp -d)
-cd "$TMP_DIR"
+command -v go  >/dev/null || err "Go 1.21+ required. https://go.dev/doc/install"
+command -v git >/dev/null || err "git required."
 
-# Clone and build
-echo "Downloading source..."
-git clone --depth 1 https://github.com/monojitgoswami69/chimera.git
-cd chimera
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
 
-echo "Building..."
-go build -o chimera .
+echo "→ cloning chimera into $tmp..."
+git -C "$tmp" clone --depth=1 "$REPO_URL"
 
-# Install to user's local bin
-INSTALL_DIR="$HOME/.local/bin"
+echo "→ building..."
+( cd "$tmp/chimera" && go build -ldflags "-s -w" -o chimera . )
+
 mkdir -p "$INSTALL_DIR"
-mv chimera "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR/chimera"
+install -m 0755 "$tmp/chimera/chimera" "$INSTALL_DIR/chimera"
 
-# Cleanup
-cd ~
-rm -rf "$TMP_DIR"
-
-echo ""
-echo "✓ Chimera installed successfully to $INSTALL_DIR/chimera"
-echo ""
-echo "Make sure $INSTALL_DIR is in your PATH:"
-echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-echo ""
-echo "Run 'chimera setup' to get started!"
+echo
+echo "✓ installed → $INSTALL_DIR/chimera"
+case ":${PATH}:" in
+  *":$INSTALL_DIR:"*) ;;
+  *) echo "  add '$INSTALL_DIR' to your PATH:"
+     echo "    export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+esac
+echo
+echo "next: chimera setup    (or:  chimera init --no-agent https://github.com/<owner>/<repo>)"
